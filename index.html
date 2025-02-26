@@ -798,10 +798,12 @@
             }
         }
         
-        // Function to create a block without outlines
+        // Function to create a block with improved visual depth cues
         function createBlock(x, y, z, type, parent) {
             // Create the main block
             const material = blockMaterials[type] || blockMaterials.stone;
+            
+            // Create the block mesh without adding any edges or outlines
             const mesh = new THREE.Mesh(blockGeometry, material);
             mesh.position.set(x, y, z);
             
@@ -1335,17 +1337,30 @@
         
         // Set up scene lighting with improved balance
         function setupLights() {
-            // Directional light (sun/moon) with warmer color
-            const directionalLight = new THREE.DirectionalLight(0xFFEAC3, 1); // Slightly warm sunlight
+            // Main directional light (sun/moon) with warmer color
+            const directionalLight = new THREE.DirectionalLight(0xFFEAC3, 1.2); // Slightly increased intensity
             directionalLight.position.set(100, 100, 50);
+            
+            // Add shadows for better depth perception
+            directionalLight.castShadow = true;
+            directionalLight.shadow.mapSize.width = 1024;
+            directionalLight.shadow.mapSize.height = 1024;
+            directionalLight.shadow.camera.near = 0.5;
+            directionalLight.shadow.camera.far = 500;
             scene.add(directionalLight);
             
+            // Add a secondary directional light from a different angle
+            const secondaryLight = new THREE.DirectionalLight(0xCCDDFF, 0.4); // Cooler light
+            secondaryLight.position.set(-50, 80, -50);
+            scene.add(secondaryLight);
+            
             // Ambient light - improved for color fidelity
-            const ambientLight = new THREE.AmbientLight(0x8097BB, 0.5); // Slightly blue ambient light
+            const ambientLight = new THREE.AmbientLight(0x8097BB, 0.5);
             scene.add(ambientLight);
             
             // Store lights for day/night cycle
             dayNightCycle.directionalLight = directionalLight;
+            dayNightCycle.secondaryLight = secondaryLight;
             dayNightCycle.ambientLight = ambientLight;
         }
         
@@ -1499,11 +1514,11 @@
             camera = new THREE.PerspectiveCamera(70, window.innerWidth / window.innerHeight, 0.1, 1000);
             camera.position.copy(player.position);
             
-            // Set up renderer with performance optimizations
-            renderer = new THREE.WebGLRenderer({ 
+            // Create renderer with WebGL 2 if available
+            renderer = new THREE.WebGLRenderer({
                 antialias: false,
-                alpha: false, // No need for alpha in a minecraft-style game
-                preserveDrawingBuffer: false, // Better performance
+                alpha: false,
+                preserveDrawingBuffer: false,
                 powerPreference: 'high-performance'
             });
             
@@ -1513,8 +1528,34 @@
             // Enable performance optimizations
             renderer.setPixelRatio(Math.min(window.devicePixelRatio, 1.5));
             
-            // Limit shadow maps and other expensive features
-            renderer.shadowMap.enabled = false;
+            // Get WebGL context
+            const gl = renderer.getContext();
+            
+            // Check for and enable WebGL extensions
+            const extensions = {
+                // Allow larger index buffers (>65536 indices)
+                uint32Indices: gl.getExtension('OES_element_index_uint'),
+                // Anisotropic filtering for better texture quality at angles
+                anisotropic: gl.getExtension('EXT_texture_filter_anisotropic'),
+                // Depth textures for better shadow mapping
+                depthTexture: gl.getExtension('WEBGL_depth_texture'),
+                // Compressed textures for memory usage optimization
+                compressedTextures: gl.getExtension('WEBGL_compressed_texture_s3tc'),
+                // Hardware instancing for better performance with many similar objects
+                instancedArrays: gl.getExtension('ANGLE_instanced_arrays'),
+                // Allow vertex shader texture access
+                vertexTextures: gl.getExtension('OES_texture_float')
+            };
+            
+            // Log available extensions
+            console.log("WebGL Extensions:", extensions);
+            
+            // Store extensions for later use
+            window.glExtensions = extensions;
+            
+            // Set up renderer with performance optimizations and shadows
+            renderer.shadowMap.enabled = true;
+            renderer.shadowMap.type = THREE.PCFSoftShadowMap; // Softer shadow edges
             
             renderer.setSize(window.innerWidth, window.innerHeight);
             renderer.setClearColor(0x87CEEB, 1);
@@ -1803,8 +1844,8 @@
         function updatePlayer(delta) {
             if (!isGameStarted) return;
             
-            // Check if player fell out of the world
-            if (player.position.y < -10) {
+            // Check if player fell out of the world - add a more reliable threshold and logging
+            if (player.position.y < -20) { // Lowered from -10 to -20 to give more leeway
                 console.log("Player fell out of the world, respawning...");
                 // Reset player position to safe spawn point
                 player.isSpawning = true;
@@ -1813,6 +1854,9 @@
                 player.velocity.set(0, 0, 0);
                 return;
             }
+            
+            // Store previous position to detect sudden large changes
+            const previousY = player.position.y;
             
             // Apply gravity
             if (!isPlayerOnGround()) {
@@ -1826,9 +1870,18 @@
                 player.velocity.y = -30;
             }
             
-            // Jump
-            if ((keyboard[' '] || keyboard['arrowup']) && isPlayerOnGround()) {
+            // Handle jump with improved tracking and button interference prevention
+            if (isGameStarted && (keyboard[' '] || keyboard['arrowup']) && isPlayerOnGround()) {
                 player.velocity.y = 8;
+                player.jumpTime = performance.now();
+                player.isJumping = true;
+                console.log("Jump executed at position:", player.position.y);
+                
+                // Force focus back to the canvas to prevent UI interference
+                const gameCanvas = document.querySelector('canvas');
+                if (gameCanvas) {
+                    gameCanvas.focus();
+                }
             }
             
             // Movement direction based on camera orientation
@@ -1884,11 +1937,29 @@
         // Check if player is on ground
         function isPlayerOnGround() {
             const pos = player.position.clone();
-            pos.y -= 0.1; // Check slightly below feet
             
-            return isPositionSolid(pos);
+            // Check slightly below feet with multiple sample points for more reliable detection
+            pos.y -= 0.1;
+            
+            // Center point check
+            if (isPositionSolid(pos)) return true;
+            
+            // Check a few points around the player for more reliable ground detection
+            const checkDistance = 0.25;
+            const checkPoints = [
+                new THREE.Vector3(pos.x + checkDistance, pos.y, pos.z),
+                new THREE.Vector3(pos.x - checkDistance, pos.y, pos.z),
+                new THREE.Vector3(pos.x, pos.y, pos.z + checkDistance),
+                new THREE.Vector3(pos.x, pos.y, pos.z - checkDistance)
+            ];
+            
+            for (const point of checkPoints) {
+                if (isPositionSolid(point)) return true;
+            }
+            
+            return false;
         }
-        
+
         // Move player with collision detection
         function movePlayerWithCollision(moveVector) {
             // X-axis movement
@@ -1901,13 +1972,24 @@
                 }
             }
             
-            // Y-axis movement
+            // Y-axis movement with improved handling
             if (moveVector.y !== 0) {
+                // Get current position before moving
+                const beforeY = player.position.y;
+                
+                // Apply movement
                 player.position.y += moveVector.y;
                 
                 // Check for collision in Y direction
                 if (isPlayerColliding()) {
-                    player.position.y -= moveVector.y;
+                    player.position.y = beforeY; // Restore exact previous position
+                    player.velocity.y = 0;
+                }
+                
+                // Safety check - don't allow extreme changes in Y position
+                if (Math.abs(player.position.y - beforeY) > 10 && !player.isSpawning) {
+                    console.log("Prevented extreme Y position change:", beforeY, "->", player.position.y);
+                    player.position.y = beforeY;
                     player.velocity.y = 0;
                 }
             }
@@ -1950,7 +2032,7 @@
                         );
                         
                         if (isPositionSolid(checkPos)) {
-                            return true;
+                    return true;
                         }
                     }
                 }
@@ -1958,7 +2040,7 @@
             
             return false;
         }
-        
+
         // Check if a position is inside a solid block
         function isPositionSolid(position) {
             const blockX = Math.floor(position.x + 0.5);
@@ -2063,7 +2145,7 @@
             
             // Only render if the game is active
             if (isGameStarted) {
-                renderer.render(scene, camera);
+            renderer.render(scene, camera);
             }
             
             // Update block selector based on inventory changes
@@ -2667,6 +2749,834 @@
             fpsDisplay.textContent = 'FPS: 0';
             document.body.appendChild(fpsDisplay);
         }
+
+        // Enhanced Chunk class with expanded LOD system
+        class Chunk {
+            constructor(x, z, size = 16) {
+                this.position = new THREE.Vector3(x * size, 0, z * size);
+                this.size = size;
+                this.blockData = {};  // Stores block types by position
+                this.lodMeshes = {
+                    0: {}, // Ultra detail: 1x1x1 blocks (0-16 units)
+                    1: {}, // High detail: 2x2x2 blocks (16-32 units)
+                    2: {}, // Medium detail: 4x4x4 blocks (32-64 units)
+                    3: {}, // Low detail: 8x8x8 blocks (64-128 units)
+                    4: {}  // Ultra low detail: 16x16x1 blocks (128+ units, terrain only)
+                };
+                this.group = new THREE.Group();
+                this.group.position.copy(this.position);
+                this.isDirty = false; // Flag for chunks that need rebuilding
+                this.lastLODLevel = -1; // Track current LOD level
+                
+                // Center point for distance calculations
+                this.center = new THREE.Vector3(
+                    this.position.x + this.size / 2,
+                    this.position.y + this.size / 2,
+                    this.position.z + this.size / 2
+                );
+            }
+            
+            // Add a block to the chunk data
+            addBlock(localX, y, localZ, blockType) {
+                const key = `${localX},${y},${localZ}`;
+                this.blockData[key] = blockType;
+                this.isDirty = true;
+            }
+            
+            // Remove a block from the chunk
+            removeBlock(localX, y, localZ) {
+                const key = `${localX},${y},${localZ}`;
+                if (this.blockData[key]) {
+                    delete this.blockData[key];
+                    this.isDirty = true;
+                }
+            }
+            
+            // Get block at position
+            getBlock(localX, y, localZ) {
+                const key = `${localX},${y},${localZ}`;
+                return this.blockData[key];
+            }
+            
+            // Update LOD based on camera distance with more levels
+            updateLOD(camera) {
+                if (this.isDirty) {
+                    this.buildMesh();
+                    return;
+                }
+                
+                // Calculate distance to camera
+                const cameraPosition = camera.position.clone();
+                const distanceToCamera = cameraPosition.distanceTo(this.center);
+                
+                // Determine LOD level based on distance with more granular levels
+                let lodLevel = 0; // Ultra detail (closest)
+                
+                if (distanceToCamera > 128) lodLevel = 4;      // Ultra low detail (furthest)
+                else if (distanceToCamera > 64) lodLevel = 3;  // Low detail
+                else if (distanceToCamera > 32) lodLevel = 2;  // Medium detail
+                else if (distanceToCamera > 16) lodLevel = 1;  // High detail
+                
+                // Only rebuild if LOD level changed
+                if (lodLevel !== this.lastLODLevel) {
+                    this.lastLODLevel = lodLevel;
+                    this.setLODVisibility(lodLevel);
+                }
+            }
+            
+            // Set visibility of appropriate LOD level
+            setLODVisibility(lodLevel) {
+                // Hide all meshes first
+                for (const level in this.lodMeshes) {
+                    for (const type in this.lodMeshes[level]) {
+                        this.lodMeshes[level][type].visible = false;
+                    }
+                }
+                
+                // Show only the current LOD level
+                if (this.lodMeshes[lodLevel]) {
+                    for (const type in this.lodMeshes[lodLevel]) {
+                        this.lodMeshes[lodLevel][type].visible = true;
+                    }
+                }
+            }
+            
+            // Build all LOD levels with enhanced gradation
+            buildMesh() {
+                // Clear previous meshes
+                for (const level in this.lodMeshes) {
+                    for (const type in this.lodMeshes[level]) {
+                        this.group.remove(this.lodMeshes[level][type]);
+                        this.lodMeshes[level][type].geometry.dispose();
+                    }
+                }
+                this.lodMeshes = {
+                    0: {}, // Ultra detail (original)
+                    1: {}, // High detail
+                    2: {}, // Medium detail
+                    3: {}, // Low detail
+                    4: {}  // Ultra low detail
+                };
+                
+                // Build LOD levels, only if they might be needed based on render distance
+                const renderDistance = 256; // Maximum view distance
+                
+                this.buildLOD0(); // Always build highest detail
+                
+                if (renderDistance > 16) this.buildLOD1();
+                if (renderDistance > 32) this.buildLOD2();
+                if (renderDistance > 64) this.buildLOD3();
+                if (renderDistance > 128) this.buildLOD4();
+                
+                // Set initial visibility based on last LOD level
+                this.setLODVisibility(this.lastLODLevel >= 0 ? this.lastLODLevel : 0);
+                
+                this.isDirty = false;
+            }
+            
+            // Build LOD level 3 (Low detail: 8x8x8 blocks)
+            buildLOD3() {
+                const blocksByMaterial = this.analyzeBlockDistribution(8);
+                
+                for (const [blockType, positions] of Object.entries(blocksByMaterial)) {
+                    // Skip empty block sets
+                    if (positions.length === 0) continue;
+                    
+                    // Use simpler material for distant blocks (no specular, simple shading)
+                    const baseMaterial = blockMaterials[blockType] || blockMaterials.stone;
+                    const material = new THREE.MeshLambertMaterial({ 
+                        color: baseMaterial.color || new THREE.Color(0x808080),
+                        flatShading: true,
+                        vertexColors: false,
+                        fog: true
+                    });
+                    
+                    // Create simplified geometry
+                    const geometry = new THREE.BufferGeometry();
+                    const vertices = [];
+                    const normals = [];
+                    const uvs = [];
+                    
+                    // Helper to check if a region face should be rendered
+                    const shouldRenderFace = (x, y, z, dx, dy, dz, size) => {
+                        const nx = x + dx * size;
+                        const ny = y + dy * size;
+                        const nz = z + dz * size;
+                        
+                        // Check if the neighboring region contains blocks of a different type
+                        for (let ix = 0; ix < size; ix++) {
+                            for (let iy = 0; iy < size; iy++) {
+                                for (let iz = 0; iz < size; iz++) {
+                                    const neighborKey = `${nx+ix},${ny+iy},${nz+iz}`;
+                                    const neighborType = this.blockData[neighborKey];
+                                    // If the neighbor is air or water, the face is visible
+                                    if (!neighborType || neighborType === 'water') {
+                                        return true;
+                                    }
+                                }
+                            }
+                        }
+                        return false;
+                    };
+                    
+                    // Process each merged block
+                    positions.forEach(pos => {
+                        const { x, y, z } = pos;
+                        const size = 8; // 8x8x8 block size
+                        
+                        // Add faces only if they're visible from outside
+                        // Front face
+                        if (shouldRenderFace(x, y, z, 0, 0, 1, size)) {
+                            vertices.push(
+                                x, y, z + size,
+                                x + size, y, z + size,
+                                x + size, y + size, z + size,
+                                x, y + size, z + size
+                            );
+                            normals.push(...Array(4).fill([0, 0, 1]).flat());
+                            uvs.push(0, 0, 1, 0, 1, 1, 0, 1);
+                        }
+                        
+                        // Back face
+                        if (shouldRenderFace(x, y, z, 0, 0, -1, size)) {
+                            vertices.push(
+                                x + size, y, z,
+                                x, y, z,
+                                x, y + size, z,
+                                x + size, y + size, z
+                            );
+                            normals.push(...Array(4).fill([0, 0, -1]).flat());
+                            uvs.push(0, 0, 1, 0, 1, 1, 0, 1);
+                        }
+                        
+                        // Top face
+                        if (shouldRenderFace(x, y, z, 0, 1, 0, size)) {
+                            vertices.push(
+                                x, y + size, z,
+                                x, y + size, z + size,
+                                x + size, y + size, z + size,
+                                x + size, y + size, z
+                            );
+                            normals.push(...Array(4).fill([0, 1, 0]).flat());
+                            uvs.push(0, 0, 1, 0, 1, 1, 0, 1);
+                        }
+                        
+                        // Bottom face
+                        if (shouldRenderFace(x, y, z, 0, -1, 0, size)) {
+                            vertices.push(
+                                x, y, z,
+                                x + size, y, z,
+                                x + size, y, z + size,
+                                x, y, z + size
+                            );
+                            normals.push(...Array(4).fill([0, -1, 0]).flat());
+                            uvs.push(0, 0, 1, 0, 1, 1, 0, 1);
+                        }
+                        
+                        // Right face
+                        if (shouldRenderFace(x, y, z, 1, 0, 0, size)) {
+                            vertices.push(
+                                x + size, y, z,
+                                x + size, y, z + size,
+                                x + size, y + size, z + size,
+                                x + size, y + size, z
+                            );
+                            normals.push(...Array(4).fill([1, 0, 0]).flat());
+                            uvs.push(0, 0, 1, 0, 1, 1, 0, 1);
+                        }
+                        
+                        // Left face
+                        if (shouldRenderFace(x, y, z, -1, 0, 0, size)) {
+                            vertices.push(
+                                x, y, z + size,
+                                x, y, z,
+                                x, y + size, z,
+                                x, y + size, z + size
+                            );
+                            normals.push(...Array(4).fill([-1, 0, 0]).flat());
+                            uvs.push(0, 0, 1, 0, 1, 1, 0, 1);
+                        }
+                    });
+                    
+                    // If no vertices, skip this material
+                    if (vertices.length === 0) continue;
+                    
+                    // Create the geometry
+                    const verticesArray = new Float32Array(vertices);
+                    const normalsArray = new Float32Array(normals);
+                    const uvsArray = new Float32Array(uvs);
+                    
+                    // Calculate indices
+                    const indices = [];
+                    for (let i = 0; i < vertices.length / 12; i++) {
+                        const baseIndex = i * 4;
+                        indices.push(
+                            baseIndex, baseIndex + 1, baseIndex + 2,
+                            baseIndex, baseIndex + 2, baseIndex + 3
+                        );
+                    }
+                    
+                    // Set geometry attributes
+                    geometry.setAttribute('position', new THREE.BufferAttribute(verticesArray, 3));
+                    geometry.setAttribute('normal', new THREE.BufferAttribute(normalsArray, 3));
+                    geometry.setAttribute('uv', new THREE.BufferAttribute(uvsArray, 2));
+                    geometry.setIndex(indices);
+                    
+                    // Create mesh with the merged geometry
+                    const mesh = new THREE.Mesh(geometry, material);
+                    mesh.visible = false; // Initially hidden
+                    this.lodMeshes[3][blockType] = mesh;
+                    this.group.add(mesh);
+                }
+            }
+            
+            // Build LOD level 4 (Ultra low detail: 16x16x1 heightmap style rendering)
+            buildLOD4() {
+                // For ultra-distant chunks, create a simplified heightmap-style representation
+                const heightData = this.generateHeightmap();
+                
+                // Create a simplified terrain mesh with reduced details
+                const geometry = new THREE.BufferGeometry();
+                const vertices = [];
+                const normals = [];
+                const uvs = [];
+                const colors = [];
+                
+                // Helper colors for different surface types
+                const typeColors = {
+                    grass: new THREE.Color(0x7CFC00),
+                    dirt: new THREE.Color(0x8B4513),
+                    stone: new THREE.Color(0x808080),
+                    water: new THREE.Color(0x1E90FF),
+                    sand: new THREE.Color(0xF4A460),
+                    wood: new THREE.Color(0x8B7355),
+                    leaves: new THREE.Color(0x228B22)
+                };
+                
+                // Create a terrain-like surface for the top of the chunk
+                for (let x = 0; x < this.size; x += 2) {
+                    for (let z = 0; z < this.size; z += 2) {
+                        const h1 = heightData[x][z];
+                        const h2 = heightData[Math.min(x+2, this.size-1)][z];
+                        const h3 = heightData[Math.min(x+2, this.size-1)][Math.min(z+2, this.size-1)];
+                        const h4 = heightData[x][Math.min(z+2, this.size-1)];
+                        
+                        const t1 = heightData.types[x][z];
+                        const t2 = heightData.types[Math.min(x+2, this.size-1)][z];
+                        const t3 = heightData.types[Math.min(x+2, this.size-1)][Math.min(z+2, this.size-1)];
+                        const t4 = heightData.types[x][Math.min(z+2, this.size-1)];
+                        
+                        // Add two triangles to form a quad
+                        vertices.push(
+                            x, h1, z,
+                            x+2, h2, z,
+                            x+2, h3, z+2,
+                            
+                            x, h1, z,
+                            x+2, h3, z+2,
+                            x, h4, z+2
+                        );
+                        
+                        // Calculate normal for the quad (cross product of two edges)
+                        const v1 = new THREE.Vector3(x+2-x, h2-h1, z-z);
+                        const v2 = new THREE.Vector3(x+2-x, h3-h1, z+2-z);
+                        const normal = new THREE.Vector3().crossVectors(v1, v2).normalize();
+                        
+                        // Add the normal 6 times (for each vertex)
+                        for (let i = 0; i < 6; i++) {
+                            normals.push(normal.x, normal.y, normal.z);
+                        }
+                        
+                        // Add UVs
+                        uvs.push(
+                            0, 0,
+                            1, 0,
+                            1, 1,
+                            
+                            0, 0,
+                            1, 1,
+                            0, 1
+                        );
+                        
+                        // Add colors based on block types
+                        const c1 = typeColors[t1] || typeColors.stone;
+                        const c2 = typeColors[t2] || typeColors.stone;
+                        const c3 = typeColors[t3] || typeColors.stone;
+                        const c4 = typeColors[t4] || typeColors.stone;
+                        
+                        colors.push(
+                            c1.r, c1.g, c1.b,
+                            c2.r, c2.g, c2.b,
+                            c3.r, c3.g, c3.b,
+                            
+                            c1.r, c1.g, c1.b,
+                            c3.r, c3.g, c3.b,
+                            c4.r, c4.g, c4.b
+                        );
+                    }
+                }
+                
+                // Create the geometry
+                const verticesArray = new Float32Array(vertices);
+                const normalsArray = new Float32Array(normals);
+                const uvsArray = new Float32Array(uvs);
+                const colorsArray = new Float32Array(colors);
+                
+                // Set geometry attributes
+                geometry.setAttribute('position', new THREE.BufferAttribute(verticesArray, 3));
+                geometry.setAttribute('normal', new THREE.BufferAttribute(normalsArray, 3));
+                geometry.setAttribute('uv', new THREE.BufferAttribute(uvsArray, 2));
+                geometry.setAttribute('color', new THREE.BufferAttribute(colorsArray, 3));
+                
+                // Use a simple material with vertex colors for the terrain
+                const material = new THREE.MeshBasicMaterial({
+                    vertexColors: true,
+                    flatShading: true,
+                    side: THREE.FrontSide
+                });
+                
+                // Create mesh
+                const mesh = new THREE.Mesh(geometry, material);
+                mesh.visible = false; // Initially hidden
+                this.lodMeshes[4]["terrain"] = mesh;
+                this.group.add(mesh);
+            }
+            
+            // Generate a heightmap for the chunk (for ultra-low LOD)
+            generateHeightmap() {
+                const heightmap = Array(this.size + 1).fill().map(() => Array(this.size + 1).fill(0));
+                const typeMap = Array(this.size + 1).fill().map(() => Array(this.size + 1).fill(''));
+                
+                // Determine highest block at each x,z coordinate
+                for (const [posKey, blockType] of Object.entries(this.blockData)) {
+                    const [x, y, z] = posKey.split(',').map(Number);
+                    
+                    if (y > heightmap[x][z]) {
+                        heightmap[x][z] = y;
+                        typeMap[x][z] = blockType;
+                    }
+                }
+                
+                // Return heightmap with types
+                return {
+                    ...heightmap,
+                    types: typeMap
+                };
+            }
+            
+            // Helper method to analyze block distribution for LOD
+            analyzeBlockDistribution(regionSize) {
+                const blocksByMaterial = {};
+                const regionStats = {};
+                
+                // Group the chunk into regions of the specified size
+                for (const [posKey, blockType] of Object.entries(this.blockData)) {
+                    const [x, y, z] = posKey.split(',').map(Number);
+                    
+                    // Calculate the region this block belongs to
+                    const rx = Math.floor(x / regionSize) * regionSize;
+                    const ry = Math.floor(y / regionSize) * regionSize;
+                    const rz = Math.floor(z / regionSize) * regionSize;
+                    const regionKey = `${rx},${ry},${rz}`;
+                    
+                    // Initialize region stats if needed
+                    if (!regionStats[regionKey]) {
+                        regionStats[regionKey] = {
+                            counts: {},
+                            total: 0,
+                            mostCommon: null,
+                            mostCommonCount: 0
+                        };
+                    }
+                    
+                    // Count block types in this region
+                    if (!regionStats[regionKey].counts[blockType]) {
+                        regionStats[regionKey].counts[blockType] = 0;
+                    }
+                    regionStats[regionKey].counts[blockType]++;
+                    regionStats[regionKey].total++;
+                    
+                    // Update most common type if needed
+                    if (regionStats[regionKey].counts[blockType] > regionStats[regionKey].mostCommonCount) {
+                        regionStats[regionKey].mostCommon = blockType;
+                        regionStats[regionKey].mostCommonCount = regionStats[regionKey].counts[blockType];
+                    }
+                }
+                
+                // Convert region stats to merged blocks by material
+                for (const [regionKey, stats] of Object.entries(regionStats)) {
+                    // Skip regions with very few blocks (less than 10% filled)
+                    if (stats.total < (regionSize * regionSize * regionSize * 0.1)) {
+                        continue;
+                    }
+                    
+                    const [rx, ry, rz] = regionKey.split(',').map(Number);
+                    const mostCommonType = stats.mostCommon;
+                    
+                    // Add this region to the appropriate material group
+                    if (!blocksByMaterial[mostCommonType]) {
+                        blocksByMaterial[mostCommonType] = [];
+                    }
+                    blocksByMaterial[mostCommonType].push({
+                        x: rx,
+                        y: ry,
+                        z: rz
+                    });
+                }
+                
+                return blocksByMaterial;
+            }
+        }
+
+        // Chunk management
+        let chunks = {};
+        const CHUNK_SIZE = 16;
+
+        // Get or create chunk at position
+        function getChunkAt(x, z) {
+            const chunkX = Math.floor(x / CHUNK_SIZE);
+            const chunkZ = Math.floor(z / CHUNK_SIZE);
+            const chunkKey = `${chunkX},${chunkZ}`;
+            
+            if (!chunks[chunkKey]) {
+                chunks[chunkKey] = new Chunk(chunkX, chunkZ, CHUNK_SIZE);
+                scene.add(chunks[chunkKey].group);
+            }
+            
+            return chunks[chunkKey];
+        }
+
+        // Add block to the world using chunk system
+        function addBlock(x, y, z, type) {
+            const chunk = getChunkAt(x, z);
+            const localX = x % CHUNK_SIZE;
+            const localZ = z % CHUNK_SIZE;
+            chunk.addBlock(localX, y, localZ, type);
+        }
+
+        // Remove block from the world
+        function removeBlock(x, y, z) {
+            const chunk = getChunkAt(x, z);
+            const localX = x % CHUNK_SIZE;
+            const localZ = z % CHUNK_SIZE;
+            chunk.removeBlock(localX, y, localZ);
+        }
+
+        // Get block at world position
+        function getBlockAt(x, y, z) {
+            const chunk = getChunkAt(x, z);
+            const localX = x % CHUNK_SIZE;
+            const localZ = z % CHUNK_SIZE;
+            return chunk.getBlock(localX, y, localZ);
+        }
+
+        // Update chunks that need rebuilding
+        function updateChunks() {
+            let anyChunkDirty = false;
+            
+            for (const chunk of Object.values(chunks)) {
+                if (chunk.isDirty) {
+                    chunk.buildMesh();
+                    anyChunkDirty = true;
+                }
+            }
+            
+            // Return true if any chunk was rebuilt
+            return anyChunkDirty;
+        }
+
+        // Update LOD for all chunks
+        function updateLODForChunks() {
+            // Get the current camera position
+            const cameraPosition = camera.position.clone();
+            
+            // Check all chunks and update their LOD based on distance
+            for (const chunkKey in chunks) {
+                const chunk = chunks[chunkKey];
+                chunk.updateLOD(camera);
+            }
+        }
+
+        // Update the render function to update LOD
+        function render() {
+            requestAnimationFrame(render);
+            
+            // Update stats if available
+            if (stats) stats.begin();
+            
+            // Update player physics
+            const delta = Math.min(clock.getDelta(), 0.1); // Cap delta time
+            updatePlayer(delta);
+            
+            // Update day-night cycle
+            if (isDayNightEnabled) {
+                updateDayNightCycle();
+            }
+            
+            // Update LOD for visible chunks
+            updateLODForChunks();
+            
+            // Render scene
+            renderer.render(scene, camera);
+            
+            // Update stats if available
+            if (stats) stats.end();
+        }
+
+        // Fix for the space key triggering both jump and biome button
+        function initializeEventHandlers() {
+            // Prevent space key from activating buttons when intended for jumping
+            document.addEventListener('keydown', function(event) {
+                // Only prevent default space behavior when game is started
+                if (event.code === 'Space' && isGameStarted) {
+                    event.preventDefault();
+                }
+            }, { passive: false });
+            
+            // Focus handling to prevent spacebar from triggering buttons
+            const gameCanvas = document.querySelector('canvas');
+            if (gameCanvas) {
+                // Keep focus on the canvas during gameplay
+                gameCanvas.addEventListener('click', function() {
+                    this.focus();
+                });
+                
+                // Make canvas focusable
+                gameCanvas.tabIndex = 1;
+            }
+            
+            // Ensure buttons use click events rather than keypress
+            const buttons = document.querySelectorAll('button');
+            buttons.forEach(button => {
+                // Replace any keyboard listeners with explicit click handlers
+                button.addEventListener('click', function(event) {
+                    // The existing click handler remains functional
+                    // This just ensures we're handling the event properly
+                });
+                
+                // Remove the button from tab navigation during gameplay
+                button.addEventListener('focus', function() {
+                    if (isGameStarted) {
+                        gameCanvas.focus();
+                    }
+                });
+            });
+        }
+
+        // Update the initKeyboardControls function to separate game controls from UI
+        function initKeyboardControls() {
+            // Keyboard controls using a consistent case for keys
+            keyboard = {};
+            
+            // Handle keydown
+            document.addEventListener('keydown', function(event) {
+                // Convert key to lowercase for consistency
+                const key = event.key.toLowerCase();
+                keyboard[key] = true;
+                
+                // Space key jumped event tracking (for debugging)
+                if (key === ' ' && isGameStarted) {
+                    console.log("Jump initiated by spacebar");
+                }
+            });
+            
+            // Handle keyup
+            document.addEventListener('keyup', function(event) {
+                // Convert key to lowercase for consistency
+                const key = event.key.toLowerCase();
+                keyboard[key] = false;
+            });
+        }
+
+        // Update the UI initialization to ensure buttons don't steal focus
+        function initUI() {
+            // ... existing UI initialization code ...
+            
+            // Get the biome button specifically
+            const biomeButton = document.getElementById('biomeButton');
+            if (biomeButton) {
+                // Ensure the biome button uses a direct click handler
+                biomeButton.addEventListener('click', function(event) {
+                    // The actual handler code would be here in the real implementation
+                    console.log("Biome button clicked via mouse");
+                    // Prevent event bubbling
+                    event.stopPropagation();
+                });
+                
+                // Remove default spacebar behavior for this button
+                biomeButton.addEventListener('keydown', function(event) {
+                    if (event.code === 'Space') {
+                        // Prevent spacebar from activating this button
+                        event.preventDefault();
+                        // Stop propagation to prevent jump
+                        event.stopPropagation();
+                    }
+                });
+            }
+            
+            // Call the new event handler initializer
+            initializeEventHandlers();
+        }
+
+        // Modify the game start function to set focus properly
+        function startGame() {
+            isGameStarted = true;
+            
+            // Hide menu and show game UI
+            document.getElementById('startMenu').style.display = 'none';
+            document.getElementById('gameUI').style.display = 'block';
+            
+            // Initialize game systems
+            initThree();
+            initKeyboardControls();
+            initUI();
+            
+            // Focus the canvas to receive keyboard events properly
+            const gameCanvas = document.querySelector('canvas');
+            if (gameCanvas) {
+                gameCanvas.focus();
+            }
+            
+            // Start the game loop
+            animate();
+        }
+
+        // Enhanced fix for spacebar triggering both jump and button clicks
+        document.addEventListener('DOMContentLoaded', function() {
+            // Global event capture for spacebar to prevent button activation
+            document.addEventListener('keydown', function(event) {
+                // Check if the game has started and it's a spacebar event
+                if (isGameStarted && (event.code === 'Space' || event.key === ' ')) {
+                    // Prevent the default action (button activation)
+                    event.preventDefault();
+                    
+                    // Stop the event from propagating to other listeners
+                    event.stopPropagation();
+                    
+                    // Manually set the keyboard state for jump processing
+                    keyboard[' '] = true;
+                    
+                    // Return false to ensure the event is fully canceled
+                    return false;
+                }
+            }, true); // The 'true' enables capturing phase, intercepting events before they reach elements
+            
+            // Handle spacebar release for jump controls
+            document.addEventListener('keyup', function(event) {
+                if (isGameStarted && (event.code === 'Space' || event.key === ' ')) {
+                    // Prevent any default action
+                    event.preventDefault();
+                    
+                    // Update keyboard state
+                    keyboard[' '] = false;
+                    
+                    // Stop propagation
+                    event.stopPropagation();
+                    return false;
+                }
+            }, true);
+            
+            // Button handling - prevent spacebar from activating buttons
+            const allButtons = document.querySelectorAll('button');
+            allButtons.forEach(button => {
+                // Disable spacebar activation on all buttons
+                button.addEventListener('keydown', function(event) {
+                    if (event.code === 'Space' || event.key === ' ') {
+                        event.preventDefault();
+                        event.stopPropagation();
+                        return false;
+                    }
+                }, true);
+                
+                // Disable button focus when game is active
+                button.addEventListener('focus', function() {
+                    if (isGameStarted) {
+                        this.blur(); // Remove focus from the button
+                        
+                        // Refocus on the game area
+                        const gameCanvas = document.querySelector('canvas');
+                        if (gameCanvas) {
+                            gameCanvas.focus();
+                        }
+                    }
+                });
+            });
+            
+            // Fix for the specific biome button
+            const biomeButton = document.getElementById('biomeButton');
+            if (biomeButton) {
+                // Replace any existing click handlers with a manual one that won't trigger on spacebar
+                const originalClickHandler = biomeButton.onclick;
+                biomeButton.onclick = null; // Remove inline handler if present
+                
+                // Create new handler that doesn't respond to keyboard events
+                biomeButton.addEventListener('click', function(event) {
+                    // Only process actual mouse clicks, not keyboard-triggered clicks
+                    if (event.isTrusted && event.type === 'click' && !event.detail.fromKeyboard) {
+                        // Call original handler if it existed
+                        if (typeof originalClickHandler === 'function') {
+                            originalClickHandler.call(this, event);
+                        }
+                    }
+                });
+            }
+        });
+
+        // Modify keyboard initialization to ensure clean state
+        function initKeyboardControls() {
+            // Reset keyboard state
+            keyboard = {};
+            
+            // Handle regular keydown events for movement keys
+            document.addEventListener('keydown', function(event) {
+                const key = event.key.toLowerCase();
+                
+                // Skip spacebar as it's handled by the global handler
+                if (key !== ' ') {
+                    keyboard[key] = true;
+                }
+            });
+            
+            // Handle regular keyup for movement keys
+            document.addEventListener('keyup', function(event) {
+                const key = event.key.toLowerCase();
+                
+                // Skip spacebar as it's handled by the global handler
+                if (key !== ' ') {
+                    keyboard[key] = false;
+                }
+            });
+        }
+
+        // Add a utility function to set focus on the game canvas
+        function focusGameCanvas() {
+            if (!isGameStarted) return;
+            
+            const gameCanvas = document.querySelector('canvas');
+            if (gameCanvas) {
+                gameCanvas.focus();
+                
+                // Make sure no buttons have focus
+                document.querySelectorAll('button').forEach(button => {
+                    button.blur();
+                });
+            }
+        }
+
+        // Call focus function after the renderer is created
+        function initThree() {
+            // ... existing initThree code ...
+            
+            // Add this at the end of the function
+            setTimeout(focusGameCanvas, 100); // Short delay to ensure everything is ready
+        }
+
+        // Also call focus on window focus events
+        window.addEventListener('focus', function() {
+            if (isGameStarted) {
+                focusGameCanvas();
+            }
+        });
     </script>
 </body>
 </html>
