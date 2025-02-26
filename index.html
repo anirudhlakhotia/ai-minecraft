@@ -1503,11 +1503,21 @@
             renderer = new THREE.WebGLRenderer({ 
                 antialias: false,
                 alpha: false, // No need for alpha in a minecraft-style game
-                preserveDrawingBuffer: false // Better performance
+                preserveDrawingBuffer: false, // Better performance
+                powerPreference: 'high-performance'
             });
+            
+            // Set precision for better performance
+            renderer.precision = 'mediump';
+            
+            // Enable performance optimizations
+            renderer.setPixelRatio(Math.min(window.devicePixelRatio, 1.5));
+            
+            // Limit shadow maps and other expensive features
+            renderer.shadowMap.enabled = false;
+            
             renderer.setSize(window.innerWidth, window.innerHeight);
             renderer.setClearColor(0x87CEEB, 1);
-            renderer.shadowMap.enabled = false;
             document.body.appendChild(renderer.domElement);
             
             // Create UI mode message
@@ -1619,6 +1629,8 @@
             
             // Initialize the highlight box after scene is created
             initHighlightBox();
+            
+            createFpsCounter();
         }
         
         // Handle window resize
@@ -2027,6 +2039,16 @@
         // Main animation loop with FPS optimization
         function animate() {
             requestAnimationFrame(animate);
+            
+            // FPS calculation
+            const now = performance.now();
+            framesThisSecond++;
+            
+            if (now > lastFpsUpdate + 1000) {
+                fpsDisplay.textContent = `FPS: ${framesThisSecond}`;
+                framesThisSecond = 0;
+                lastFpsUpdate = now;
+            }
             
             const delta = Math.min(clock.getDelta(), 0.1); // Cap delta time to prevent jumps
             
@@ -2620,6 +2642,31 @@
             // Reset color on mouse up
             highlightBox.material.color.setHex(0xffffff);
         });
+
+        // Add this to the global variables section
+        let fpsDisplay;
+        let lastFpsUpdate = 0;
+        let framesThisSecond = 0;
+
+        // Add this function to init() before the end
+        function createFpsCounter() {
+            // Create FPS display element
+            fpsDisplay = document.createElement('div');
+            fpsDisplay.id = 'fpsCounter';
+            fpsDisplay.style.position = 'fixed';
+            fpsDisplay.style.top = '10px';
+            fpsDisplay.style.left = '10px';
+            fpsDisplay.style.background = 'rgba(0, 0, 0, 0.7)';
+            fpsDisplay.style.color = '#00FF00'; // Bright green for better visibility
+            fpsDisplay.style.padding = '5px 10px';
+            fpsDisplay.style.borderRadius = '5px';
+            fpsDisplay.style.fontFamily = 'monospace';
+            fpsDisplay.style.fontSize = '16px';
+            fpsDisplay.style.fontWeight = 'bold';
+            fpsDisplay.style.zIndex = '9999'; // Ensure it's always on top
+            fpsDisplay.textContent = 'FPS: 0';
+            document.body.appendChild(fpsDisplay);
+        }
     </script>
 </body>
 </html>
