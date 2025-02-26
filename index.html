@@ -1718,11 +1718,28 @@
                 
                 // Update inventory display
                 updateInventoryDisplay();
+                
+                // Remove block from chunk data
+                delete chunk.blockPositions[posKey];
+                
+                // Find and remove the actual block mesh from the scene
+                // We need to search through all the children of the chunk group
+                for (let i = chunk.children.length - 1; i >= 0; i--) {
+                    const blockMesh = chunk.children[i];
+                    // Check if this mesh is at the same position as our target block
+                    if (Math.abs(blockMesh.position.x - blockPosition.x) < 0.1 && 
+                        Math.abs(blockMesh.position.y - blockPosition.y) < 0.1 && 
+                        Math.abs(blockMesh.position.z - blockPosition.z) < 0.1) {
+                        // Remove this mesh from the scene
+                        chunk.remove(blockMesh);
+                        break; // We found and removed the block, so stop searching
+                    }
+                }
+                
+                console.log(`Removed block of type ${blockType} at ${posKey}, added to inventory`);
+            } else {
+                console.log("No block data found at position:", posKey);
             }
-            
-            // Remove block from chunk data and update terrain
-            delete chunk.blockPositions[posKey];
-            generateTerrain();
         }
         
         // Place a block
@@ -2128,42 +2145,78 @@
             const inventoryDisplayElement = document.getElementById('inventoryDisplay');
             inventoryDisplayElement.innerHTML = '';
             
-            // Only show a few important resources in the main display
-            const displayItems = ['wood', 'stone', 'dirt', 'stick'];
+            // Show all available materials in the player's inventory
+            // Get all items that the player has at least one of
+            const availableItems = Object.entries(playerInventory)
+                .filter(([item, quantity]) => quantity > 0)
+                .map(([item]) => item);
             
-            for (const item of displayItems) {
-                if (playerInventory[item] > 0) {
-                    const itemDiv = document.createElement('div');
-                    itemDiv.className = 'invItem';
-                    
-                    const icon = document.createElement('div');
-                    icon.className = 'invIcon';
-                    
-                    // Use custom render function if available for smaller icon
-                    if (itemProperties[item].render) {
-                        icon.style.position = "relative";
-                        icon.style.overflow = "hidden";
-                        
-                        const miniItem = document.createElement('div');
-                        miniItem.style.transformOrigin = "top left";
-                        miniItem.style.transform = "scale(0.5)";
-                        miniItem.style.width = "40px";
-                        miniItem.style.height = "40px";
-                        miniItem.style.position = "absolute";
-                        
-                        itemProperties[item].render(miniItem);
-                        icon.appendChild(miniItem);
-                    } else {
-                        icon.style.backgroundColor = itemProperties[item].color;
-                    }
-                    
-                    const count = document.createElement('span');
-                    count.textContent = playerInventory[item];
-                    
-                    itemDiv.appendChild(icon);
-                    itemDiv.appendChild(count);
-                    inventoryDisplayElement.appendChild(itemDiv);
+            // Materials to prioritize at the beginning of the display
+            const priorityItems = ['wood', 'stone', 'dirt', 'grass', 'sand', 'snow'];
+            
+            // Sort items so priority items come first, then alphabetical
+            const sortedItems = availableItems.sort((a, b) => {
+                const aIndex = priorityItems.indexOf(a);
+                const bIndex = priorityItems.indexOf(b);
+                
+                // If both are priority items, sort by priority list order
+                if (aIndex >= 0 && bIndex >= 0) {
+                    return aIndex - bIndex;
                 }
+                // If only a is a priority item, it comes first
+                if (aIndex >= 0) return -1;
+                // If only b is a priority item, it comes first
+                if (bIndex >= 0) return 1;
+                // Otherwise alphabetical
+                return a.localeCompare(b);
+            });
+            
+            // Add items to the display
+            for (const item of sortedItems) {
+                // Skip tools and crafted items from the main display
+                if (['wooden_pickaxe', 'stone_pickaxe', 'wooden_axe', 'stone_axe', 'crafting_table'].includes(item)) {
+                    continue;
+                }
+                
+                const itemDiv = document.createElement('div');
+                itemDiv.className = 'invItem';
+                
+                const icon = document.createElement('div');
+                icon.className = 'invIcon';
+                
+                // Make sure we have valid item properties
+                if (!itemProperties[item]) {
+                    // Add missing item properties
+                    itemProperties[item] = {
+                        color: getDefaultColorForItem(item),
+                        name: formatItemName(item)
+                    };
+                }
+                
+                // Use custom render function if available for smaller icon
+                if (itemProperties[item].render) {
+                    icon.style.position = "relative";
+                    icon.style.overflow = "hidden";
+                    
+                    const miniItem = document.createElement('div');
+                    miniItem.style.transformOrigin = "top left";
+                    miniItem.style.transform = "scale(0.5)";
+                    miniItem.style.width = "40px";
+                    miniItem.style.height = "40px";
+                    miniItem.style.position = "absolute";
+                    
+                    itemProperties[item].render(miniItem);
+                    icon.appendChild(miniItem);
+                } else {
+                    icon.style.backgroundColor = itemProperties[item].color;
+                }
+                
+                const count = document.createElement('span');
+                count.textContent = playerInventory[item];
+                
+                itemDiv.appendChild(icon);
+                itemDiv.appendChild(count);
+                inventoryDisplayElement.appendChild(itemDiv);
             }
         }
         
@@ -2418,6 +2471,35 @@
                     blockType.style.display = playerInventory[type] > 0 ? 'flex' : 'none';
                 }
             });
+        }
+
+        // Helper function to get a default color for items that may not be defined
+        function getDefaultColorForItem(item) {
+            // Default colors for common materials
+            const defaultColors = {
+                grass: "#3A9D23",
+                dirt: "#59472B",
+                stone: "#666666",
+                sand: "#DBC681",
+                sand_light: "#E8D9A0",
+                sand_red: "#C2A477",
+                sand_gold: "#D4B16A",
+                sand_dark: "#B49B6C",
+                wood: "#52341D",
+                snow: "#F5F5F5",
+                water: "#1A45A5",
+                cactus: "#2D742F",
+                stick: "#8B5A2B"
+            };
+            
+            return defaultColors[item] || "#AAAAAA"; // Default gray for unknown items
+        }
+
+        // Helper function to format item name for display
+        function formatItemName(item) {
+            return item.split('_')
+                .map(word => word.charAt(0).toUpperCase() + word.slice(1))
+                .join(' ');
         }
     </script>
 </body>
