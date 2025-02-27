@@ -380,6 +380,20 @@
         // Global variables
         let scene, camera, renderer, controls;
         let terrain = {}, worldSize = 16, chunkSize = 16, viewDistance = 2;
+        let chunkLoadingQueue = []; // Queue for chunks to be loaded
+        let processingChunk = false; // Flag to track if we're currently processing a chunk
+        let playerDirection = new THREE.Vector3(); // Track player movement direction for predictive loading
+        let previousPlayerPosition = new THREE.Vector3(); // Previous player position for direction calculation
+        let lastDirectionUpdateTime = 0; // Time tracking for direction updates
+        let chunkRenderDistance = {
+            minimum: 1,  // Minimum render distance (closest to player)
+            ideal: 2,    // Standard render distance
+            maximum: 3,  // Maximum render distance (for pre-loading)
+            preloadFar: 4 // Distance to load low-detail chunks ahead of player
+        };
+        let chunkCache = {}; // Cache for storing chunk data even when not visible
+        let maxCachedChunks = 500; // Maximum number of chunks to keep in cache
+        let chunkModifications = {}; // Track player modifications to chunks
         let player = { 
             position: new THREE.Vector3(0, 100, 0), // Start at a safe height
             velocity: new THREE.Vector3(0, 0, 0),
@@ -861,12 +875,98 @@
         }
         
         // Generate a single terrain chunk with optimized and fixed performance
-        function generateChunk(chunkX, chunkZ) {
+        function generateChunk(chunkX, chunkZ, priority = 0, fadeIn = true) {
             const chunkKey = `${chunkX},${chunkZ}`;
-            if (terrain[chunkKey]) return;
             
+            // If chunk already exists in the scene, don't regenerate
+            if (terrain[chunkKey]) {
+                console.log(`Chunk ${chunkKey} already exists in terrain, skipping generation`);
+                return null;
+            }
+            
+            // Check if we have the chunk in our cache
+            if (chunkCache[chunkKey]) {
+                console.log(`Restoring cached chunk: ${chunkKey}`);
+                
+                // Take the chunk from cache and add it back to the scene
+                const chunkGroup = chunkCache[chunkKey];
+                delete chunkCache[chunkKey]; // Remove from cache to avoid duplication
+                
+                // Setup fade in if needed
+                if (fadeIn) {
+                    chunkGroup.visible = true;
+                    chunkGroup.userData = {
+                        fadeState: 'in',
+                        fadeProgress: 0,
+                        fadeSpeed: 0.05,
+                        fullyLoaded: false,
+                        chunkX: chunkX,
+                        chunkZ: chunkZ,
+                        lastAccessed: Date.now()
+                    };
+                    
+                    // Set all materials to be transparent for fading
+                    chunkGroup.traverse(object => {
+                        if (object.material) {
+                            object.material.transparent = true;
+                            if (typeof object.material.opacity === 'undefined') {
+                                object.material._originalOpacity = 1;
+                            }
+                            object.material.opacity = 0;
+                            object.material.needsUpdate = true;
+                        }
+                    });
+                } else {
+                    chunkGroup.userData = {
+                        fadeState: 'visible',
+                        fadeProgress: 1,
+                        fullyLoaded: true,
+                        chunkX: chunkX,
+                        chunkZ: chunkZ,
+                        lastAccessed: Date.now()
+                    };
+                }
+                
+                // Add the chunk to the scene
+                scene.add(chunkGroup);
+                terrain[chunkKey] = chunkGroup;
+                
+                // Check if this chunk has any player modifications
+                if (chunkModifications[chunkKey]) {
+                    applyChunkModifications(chunkKey, chunkGroup);
+                }
+                
+                return chunkGroup;
+            }
+            
+            console.log(`Generating new chunk: ${chunkKey}`);
+            
+            // Create a new chunk group
             const chunkGroup = new THREE.Group();
             chunkGroup.blockPositions = {};
+            
+            // If fadeIn is enabled, start with opacity 0
+            if (fadeIn) {
+                chunkGroup.visible = true;
+                chunkGroup.userData = {
+                    fadeState: 'in',
+                    fadeProgress: 0,
+                    fadeSpeed: 0.05, // Adjust for faster/slower fade
+                    fullyLoaded: false,
+                    chunkX: chunkX,
+                    chunkZ: chunkZ,
+                    lastAccessed: Date.now()
+                };
+            } else {
+                chunkGroup.userData = {
+                    fadeState: 'visible',
+                    fadeProgress: 1,
+                    fullyLoaded: true,
+                    chunkX: chunkX,
+                    chunkZ: chunkZ,
+                    lastAccessed: Date.now()
+                };
+            }
             
             // Distance from player for LOD
             const playerChunkX = Math.floor(player.position.x / chunkSize);
@@ -888,6 +988,12 @@
                 chunkGroup.blockPositions[posKey] = { type: blockType };
             }
             
+            // Check if this chunk has any player modifications before generating
+            let hasModifications = false;
+            if (chunkModifications[chunkKey]) {
+                hasModifications = true;
+            }
+            
             // Generate blocks in chunk based on deterministic noise
             for (let x = 0; x < chunkSize; x++) {
                 for (let z = 0; z < chunkSize; z++) {
@@ -904,6 +1010,17 @@
                     
                     // Generate blocks from surface to calculated depth
                     for (let y = height - 1; y > height - renderDepth && y >= 0; y--) {
+                        // Check if this position has been modified by the player
+                        const worldPosKey = `${worldX},${y},${worldZ}`;
+                        if (hasModifications && chunkModifications[chunkKey][worldPosKey]) {
+                            const modification = chunkModifications[chunkKey][worldPosKey];
+                            if (modification.action === 'add') {
+                                addToBatch(worldX, y, worldZ, modification.blockType);
+                            }
+                            // For 'remove' action, we simply don't add the block
+                            continue;
+                        }
+                        
                         // Determine block type based on height and biome with more natural distribution
                         let blockType;
                         
@@ -1005,7 +1122,7 @@
                     }
                     
                     // Add biome-specific features with deterministic placement only in close chunks
-                    if (distanceFromPlayer === 0) {
+                    if (distanceFromPlayer <= 1) {
                         // Use a deterministic seed for features so they don't change when we regenerate chunks
                         const featureSeed = worldX * 10000 + worldZ;
                         const featureRandom = seededRandom(featureSeed);
@@ -1045,41 +1162,73 @@
             for (const [blockType, positions] of Object.entries(blocksByMaterial)) {
                 if (positions.length === 0) continue;
                 
-                // Get the material for this block type
-                const material = blockMaterials[blockType] || blockMaterials.stone;
+                // Skip if we don't have a valid material for this block type
+                if (!blockMaterials[blockType]) {
+                    console.warn(`Missing material for block type: ${blockType}`);
+                    continue;
+                }
                 
-                // If there are lots of blocks, use instancing for better performance
-                if (positions.length > 10) {
-                    const instancedMesh = new THREE.InstancedMesh(
-                        blockGeometry,
-                        material.clone(), // Clone material to avoid shared material issues
-                        positions.length
-                    );
-                    
-                    // Set matrix for each instance
-                    const matrix = new THREE.Matrix4();
-                    for (let i = 0; i < positions.length; i++) {
-                        const pos = positions[i];
-                        matrix.setPosition(pos.x, pos.y, pos.z);
-                        instancedMesh.setMatrixAt(i, matrix);
+                // Get the material for this block type
+                const material = blockMaterials[blockType];
+                
+                // Create a copy of the material that can be modified for the fade effect
+                const fadeMaterial = material.clone();
+                
+                // If we're fading in, start with transparent material
+                if (fadeIn) {
+                    fadeMaterial.transparent = true;
+                    fadeMaterial.opacity = 0;
+                }
+                
+                try {
+                    // If there are lots of blocks, use instancing for better performance
+                    if (positions.length > 10) {
+                        const instancedMesh = new THREE.InstancedMesh(
+                            blockGeometry,
+                            fadeMaterial,
+                            positions.length
+                        );
+                        
+                        // Set matrix for each instance
+                        const matrix = new THREE.Matrix4();
+                        for (let i = 0; i < positions.length; i++) {
+                            const pos = positions[i];
+                            matrix.setPosition(pos.x, pos.y, pos.z);
+                            instancedMesh.setMatrixAt(i, matrix);
+                        }
+                        
+                        // Update the instance buffer
+                        instancedMesh.instanceMatrix.needsUpdate = true;
+                        chunkGroup.add(instancedMesh);
+                    } 
+                    // For a small number of blocks, regular meshes are fine
+                    else {
+                        positions.forEach(pos => {
+                            const mesh = new THREE.Mesh(blockGeometry, fadeMaterial);
+                            mesh.position.set(pos.x, pos.y, pos.z);
+                            chunkGroup.add(mesh);
+                        });
                     }
-                    
-                    // Update the instance buffer
-                    instancedMesh.instanceMatrix.needsUpdate = true;
-                    chunkGroup.add(instancedMesh);
-                } 
-                // For a small number of blocks, regular meshes are fine
-                else {
-                    positions.forEach(pos => {
-                        const mesh = new THREE.Mesh(blockGeometry, material);
-                        mesh.position.set(pos.x, pos.y, pos.z);
-                        chunkGroup.add(mesh);
-                    });
+                } catch (error) {
+                    console.error(`Error creating mesh for block type ${blockType}:`, error);
                 }
             }
             
+            // Add the chunk to the scene
             scene.add(chunkGroup);
             terrain[chunkKey] = chunkGroup;
+            
+            // Mark the chunk as fully loaded when generation is complete
+            if (!fadeIn) {
+                chunkGroup.userData.fullyLoaded = true;
+            }
+            
+            // Apply any modifications if they exist
+            if (hasModifications) {
+                applyChunkModifications(chunkKey, chunkGroup);
+            }
+            
+            return chunkGroup;
         }
         
         // Create a tall grass decoration
@@ -1219,59 +1368,232 @@
             }
         }
         
-        // Function to generate terrain with optimization
+        // Function to generate terrain with optimization and caching
         function generateTerrain() {
             console.log("Generating terrain with biome:", currentBiome);
             
             // Clear terrain if switching biomes or initial spawn
             if (player.isSpawning) {
+                // When spawning, we actually need to clear everything
                 Object.keys(terrain).forEach(chunkKey => {
+                    disposeChunk(terrain[chunkKey]);
                     scene.remove(terrain[chunkKey]);
                     delete terrain[chunkKey];
                 });
                 terrain = {};
+                chunkCache = {}; // Also clear the cache
+                chunkModifications = {}; // Clear modifications
+                chunkLoadingQueue = []; // Clear the loading queue
             }
             
             // Get player chunk position
             const playerChunkX = Math.floor(player.position.x / chunkSize);
             const playerChunkZ = Math.floor(player.position.z / chunkSize);
             
+            // Update player direction for predictive loading
+            updatePlayerDirection();
+            
             // Track which chunks should remain active
             const activeChunks = new Set();
             
-            // Generate chunks around player
-            for (let x = -viewDistance; x <= viewDistance; x++) {
-                for (let z = -viewDistance; z <= viewDistance; z++) {
+            // Clear the loading queue to avoid stale chunks
+            chunkLoadingQueue = [];
+            
+            // Calculate the forward direction for chunk preloading
+            let lookAheadX = Math.round(playerDirection.x * 2);
+            let lookAheadZ = Math.round(playerDirection.z * 2);
+            
+            // If we don't have a clear direction, default to player's orientation
+            if (Math.abs(lookAheadX) < 0.5 && Math.abs(lookAheadZ) < 0.5) {
+                // Use camera direction instead
+                const cameraDirection = controls.getDirection(new THREE.Vector3());
+                cameraDirection.y = 0;
+                cameraDirection.normalize();
+                cameraDirection.multiplyScalar(2);
+                lookAheadX = Math.round(cameraDirection.x);
+                lookAheadZ = Math.round(cameraDirection.z);
+            }
+            
+            // For debugging
+            console.log(`Player at chunk (${playerChunkX}, ${playerChunkZ}), looking toward (${lookAheadX}, ${lookAheadZ})`);
+            
+            // Generate chunks in multiple passes with different priorities
+            
+            // Pass 1: Immediate visibility chunks (highest priority)
+            for (let x = -chunkRenderDistance.minimum; x <= chunkRenderDistance.minimum; x++) {
+                for (let z = -chunkRenderDistance.minimum; z <= chunkRenderDistance.minimum; z++) {
                     const chunkX = playerChunkX + x;
                     const chunkZ = playerChunkZ + z;
                     const chunkKey = `${chunkX},${chunkZ}`;
                     
-                    // Add to active chunks set
                     activeChunks.add(chunkKey);
                     
-                    // Generate the chunk if it doesn't exist
-                    generateChunk(chunkX, chunkZ);
+                    // Generate immediately and with no fade for close chunks
+                    if (!terrain[chunkKey]) {
+                        console.log(`Immediate generation of chunk ${chunkKey}`);
+                        const newChunk = generateChunk(chunkX, chunkZ, 3, false);
+                        if (newChunk) {
+                            console.log(`Successfully generated chunk ${chunkKey}`);
+                        } else {
+                            console.log(`Failed to generate chunk ${chunkKey}`);
+                        }
+                    } else {
+                        // Update last accessed time for this chunk
+                        if (terrain[chunkKey].userData) {
+                            terrain[chunkKey].userData.lastAccessed = Date.now();
+                        }
+                    }
                 }
             }
             
-            // Remove chunks that are too far from the player
+            // Pass 2: Standard visibility range (high priority)
+            for (let x = -chunkRenderDistance.ideal; x <= chunkRenderDistance.ideal; x++) {
+                for (let z = -chunkRenderDistance.ideal; z <= chunkRenderDistance.ideal; z++) {
+                    // Skip chunks already processed in pass 1
+                    if (Math.abs(x) <= chunkRenderDistance.minimum && Math.abs(z) <= chunkRenderDistance.minimum) 
+                        continue;
+                    
+                    const chunkX = playerChunkX + x;
+                    const chunkZ = playerChunkZ + z;
+                    const chunkKey = `${chunkX},${chunkZ}`;
+                    
+                    activeChunks.add(chunkKey);
+                    
+                    if (terrain[chunkKey]) {
+                        // Update last accessed time for this chunk
+                        if (terrain[chunkKey].userData) {
+                            terrain[chunkKey].userData.lastAccessed = Date.now();
+                        }
+                    } else {
+                        // Add to loading queue with high priority
+                        console.log(`Queueing chunk ${chunkKey} with high priority`);
+                        chunkLoadingQueue.push({
+                            x: chunkX,
+                            z: chunkZ,
+                            priority: 2,
+                            fadeIn: true
+                        });
+                    }
+                }
+            }
+            
+            // Pass 3: Extended visibility (medium priority)
+            for (let x = -chunkRenderDistance.maximum; x <= chunkRenderDistance.maximum; x++) {
+                for (let z = -chunkRenderDistance.maximum; z <= chunkRenderDistance.maximum; z++) {
+                    // Skip chunks already processed in earlier passes
+                    if (Math.abs(x) <= chunkRenderDistance.ideal && Math.abs(z) <= chunkRenderDistance.ideal) 
+                        continue;
+                    
+                    const chunkX = playerChunkX + x;
+                    const chunkZ = playerChunkZ + z;
+                    const chunkKey = `${chunkX},${chunkZ}`;
+                    
+                    activeChunks.add(chunkKey);
+                    
+                    if (terrain[chunkKey]) {
+                        // Update last accessed time for this chunk
+                        if (terrain[chunkKey].userData) {
+                            terrain[chunkKey].userData.lastAccessed = Date.now();
+                        }
+                    } else {
+                        // Add to loading queue with medium priority
+                        chunkLoadingQueue.push({
+                            x: chunkX,
+                            z: chunkZ,
+                            priority: 1,
+                            fadeIn: true
+                        });
+                    }
+                }
+            }
+            
+            // Pass 4: Look-ahead chunks in player movement direction (low priority)
+            if (lookAheadX !== 0 || lookAheadZ !== 0) {
+                const lookDistance = chunkRenderDistance.preloadFar;
+                
+                for (let dist = chunkRenderDistance.maximum + 1; dist <= lookDistance; dist++) {
+                    // Generate chunks ahead in player's movement direction
+                    for (let spread = -1; spread <= 1; spread++) {
+                        // Calculate positions along movement vector
+                        let preloadX, preloadZ;
+                        
+                        if (Math.abs(lookAheadX) > Math.abs(lookAheadZ)) {
+                            // Moving primarily along X axis
+                            preloadX = playerChunkX + (lookAheadX > 0 ? dist : -dist);
+                            preloadZ = playerChunkZ + spread;
+                        } else {
+                            // Moving primarily along Z axis
+                            preloadX = playerChunkX + spread;
+                            preloadZ = playerChunkZ + (lookAheadZ > 0 ? dist : -dist);
+                        }
+                        
+                        const chunkKey = `${preloadX},${preloadZ}`;
+                        activeChunks.add(chunkKey);
+                        
+                        if (terrain[chunkKey]) {
+                            // Update last accessed time for this chunk
+                            if (terrain[chunkKey].userData) {
+                                terrain[chunkKey].userData.lastAccessed = Date.now();
+                            }
+                        } else {
+                            // Add to loading queue with low priority
+                            chunkLoadingQueue.push({
+                                x: preloadX,
+                                z: preloadZ,
+                                priority: 0,
+                                fadeIn: true
+                            });
+                        }
+                    }
+                }
+            }
+            
+            // Log active chunks for debugging
+            console.log(`Active chunks: ${activeChunks.size}`);
+            
+            // Manage chunk hibernation (move to cache instead of disposal)
             Object.keys(terrain).forEach(chunkKey => {
                 if (!activeChunks.has(chunkKey)) {
-                    // Properly dispose of the chunk's geometries and materials to free memory
                     const chunk = terrain[chunkKey];
                     
-                    // Recursively dispose of all meshes, geometries, and materials in the chunk
-                    disposeChunk(chunk);
-                    
-                    // Remove from scene
-                    scene.remove(chunk);
-                    
-                    // Delete from terrain object
-                    delete terrain[chunkKey];
-                    
-                    console.log(`Removed distant chunk: ${chunkKey}`);
+                    // Don't fade chunks that aren't fully loaded yet
+                    if (!chunk.userData || !chunk.userData.fullyLoaded) {
+                        console.log(`Immediately disposing not-fully-loaded chunk: ${chunkKey}`);
+                        disposeChunk(chunk);
+                        scene.remove(chunk);
+                        delete terrain[chunkKey];
+                    } 
+                    // Start fade out for chunks that should be cached
+                    else if (chunk.userData.fadeState !== 'out') {
+                        console.log(`Starting fade-out for chunk: ${chunkKey}`);
+                        chunk.userData.fadeState = 'out';
+                        chunk.userData.fadeProgress = 1;
+                        chunk.userData.targetCache = true; // Mark for caching instead of removal
+                        
+                        // Make sure material is set up for fading
+                        chunk.traverse(object => {
+                            if (object.material) {
+                                object.material.transparent = true;
+                                // Store original opacity if needed
+                                if (typeof object.material.opacity === 'undefined' || 
+                                    !object.material.hasOwnProperty('_originalOpacity')) {
+                                    object.material._originalOpacity = object.material.opacity;
+                                }
+                                object.material.needsUpdate = true;
+                            }
+                        });
+                    }
                 }
             });
+            
+            // Debug info
+            console.log(`Currently ${Object.keys(terrain).length} active chunks, ${chunkLoadingQueue.length} in queue, ${Object.keys(chunkCache).length} in cache`);
+            
+            // Start processing the chunk queue
+            processChunkQueue();
+            
+            // If cache is getting too large, prune the oldest chunks
+            pruneChunkCache();
             
             // If this is initial spawn, check for a safe position
             if (player.isSpawning) {
@@ -1290,25 +1612,131 @@
                 }, 100);
             }
         }
-
-        // Function to properly dispose of a chunk's resources
-        function disposeChunk(chunk) {
-            // Skip if chunk is not valid
-            if (!chunk) return;
+        
+        // Function to remove old chunks from cache when it gets too large
+        function pruneChunkCache() {
+            const cacheSize = Object.keys(chunkCache).length;
+            if (cacheSize <= maxCachedChunks) return;
             
-            // Traverse all children in the chunk
-            chunk.traverse(object => {
-                // Dispose of geometries
-                if (object.geometry) {
-                    object.geometry.dispose();
+            console.log(`Pruning chunk cache. Current size: ${cacheSize}`);
+            
+            // Convert cache to array for sorting
+            const chunks = Object.entries(chunkCache).map(([key, chunk]) => {
+                return {
+                    key: key,
+                    chunk: chunk,
+                    lastAccessed: chunk.userData ? chunk.userData.lastAccessed || 0 : 0
+                };
+            });
+            
+            // Sort by last accessed time (oldest first)
+            chunks.sort((a, b) => a.lastAccessed - b.lastAccessed);
+            
+            // Remove oldest chunks until we're back under the limit
+            const toRemove = cacheSize - maxCachedChunks;
+            for (let i = 0; i < toRemove; i++) {
+                const chunk = chunks[i];
+                console.log(`Removing old chunk from cache: ${chunk.key}, last accessed: ${new Date(chunk.lastAccessed).toLocaleTimeString()}`);
+                disposeChunk(chunk.chunk);
+                delete chunkCache[chunk.key];
+            }
+            
+            console.log(`Cache pruned. New size: ${Object.keys(chunkCache).length}`);
+        }
+
+        // Update all chunk fade transitions with caching
+        function updateChunkFades(delta) {
+            Object.values(terrain).forEach(chunk => {
+                if (!chunk.userData) return;
+                
+                // Handle fade in
+                if (chunk.userData.fadeState === 'in' && chunk.userData.fadeProgress < 1) {
+                    chunk.userData.fadeProgress += chunk.userData.fadeSpeed;
+                    
+                    if (chunk.userData.fadeProgress >= 1) {
+                        chunk.userData.fadeProgress = 1;
+                        chunk.userData.fadeState = 'visible';
+                        chunk.userData.fullyLoaded = true;
+                        
+                        // Fix materials after fade completes
+                        chunk.traverse(object => {
+                            if (object.material && object.material.transparent) {
+                                object.material.opacity = 1;
+                                
+                                // Only turn off transparency if the material should be fully opaque
+                                if (object.material.type !== 'MeshLambertMaterial' || 
+                                    !object.material._originalOpacity || 
+                                    object.material._originalOpacity >= 1) {
+                                    object.material.transparent = false;
+                                    object.material.needsUpdate = true;
+                                }
+                            }
+                        });
+                    } else {
+                        // Update opacity during fade
+                        const opacity = chunk.userData.fadeProgress;
+                        chunk.traverse(object => {
+                            if (object.material) {
+                                if (!object.material.transparent) {
+                                    object.material.transparent = true;
+                                    // Store original opacity if it exists
+                                    if (typeof object.material.opacity !== 'undefined') {
+                                        object.material._originalOpacity = object.material.opacity;
+                                    }
+                                }
+                                object.material.opacity = opacity * (object.material._originalOpacity || 1);
+                                object.material.needsUpdate = true;
+                            }
+                        });
+                    }
                 }
                 
-                // Dispose of materials (could be an array or a single material)
-                if (object.material) {
-                    if (Array.isArray(object.material)) {
-                        object.material.forEach(material => material.dispose());
+                // Handle fade out
+                else if (chunk.userData.fadeState === 'out' && chunk.userData.fadeProgress > 0) {
+                    chunk.userData.fadeProgress -= chunk.userData.fadeSpeed * 2; // Faster fade out
+                    
+                    if (chunk.userData.fadeProgress <= 0) {
+                        chunk.userData.fadeProgress = 0;
+                        
+                        // Find chunk key
+                        let chunkKey = null;
+                        for (const key in terrain) {
+                            if (terrain[key] === chunk) {
+                                chunkKey = key;
+                                break;
+                            }
+                        }
+                        
+                        // If the chunk is marked for caching and we have a valid key, move it to cache
+                        if (chunk.userData.targetCache && chunkKey) {
+                            console.log(`Moving chunk to cache: ${chunkKey}`);
+                            // Store in cache instead of disposing
+                            scene.remove(chunk);
+                            chunkCache[chunkKey] = chunk;
+                            delete terrain[chunkKey];
+                        } else {
+                            console.log(`Disposing chunk: ${chunkKey || 'unknown'}`);
+                            // Remove the chunk completely
+                            disposeChunk(chunk);
+                            scene.remove(chunk);
+                            
+                            // Find and remove from terrain object
+                            if (chunkKey) {
+                                delete terrain[chunkKey];
+                            }
+                        }
                     } else {
-                        object.material.dispose();
+                        // Update opacity during fade
+                        const opacity = chunk.userData.fadeProgress;
+                        chunk.traverse(object => {
+                            if (object.material) {
+                                if (!object.material.transparent) {
+                                    object.material.transparent = true;
+                                }
+                                object.material.opacity = opacity * (object.material._originalOpacity || 1);
+                                object.material.needsUpdate = true;
+                            }
+                        });
                     }
                 }
             });
@@ -1796,6 +2224,9 @@
                 // Remove block from chunk data
                 delete chunk.blockPositions[posKey];
                 
+                // Record this modification 
+                recordChunkModification(blockPosition.x, blockPosition.y, blockPosition.z, 'remove');
+                
                 // Find and remove the actual block mesh from the scene
                 // We need to search through all the children of the chunk group
                 for (let i = chunk.children.length - 1; i >= 0; i--) {
@@ -1847,8 +2278,14 @@
                         index: Object.keys(chunk.blockPositions).length
                     };
                     
-                    // Regenerate terrain for simplicity
-                    generateTerrain();
+                    // Record this modification
+                    recordChunkModification(x, y, z, 'add', selectedBlockType);
+                    
+                    // Create the block in the world
+                    const material = blockMaterials[selectedBlockType] || blockMaterials.stone;
+                    const mesh = new THREE.Mesh(blockGeometry, material.clone());
+                    mesh.position.set(x, y, z);
+                    chunk.add(mesh);
                 }
             } else {
                 console.log("Not enough resources to place this block");
@@ -1858,6 +2295,9 @@
         // Update player physics (optimized) with falling detection
         function updatePlayer(delta) {
             if (!isGameStarted) return;
+            
+            // Store previous position for direction calculation
+            previousPlayerPosition.copy(player.position);
             
             // Check if player fell out of the world - add a more reliable threshold and logging
             if (player.position.y < -20) { // Lowered from -10 to -20 to give more leeway
@@ -1952,7 +2392,7 @@
                 Math.pow(player.position.z - player.lastGlobalZ, 2)
             );
             
-            if (distanceMoved > chunkSize * viewDistance * 2) {
+            if (distanceMoved > chunkSize * chunkRenderDistance.maximum * 2) {
                 console.log("Player moved a large distance, resetting terrain completely");
                 player.lastGlobalX = player.position.x;
                 player.lastGlobalZ = player.position.z;
@@ -1964,10 +2404,15 @@
                     delete terrain[chunkKey];
                 });
                 
+                // Clear loading queue
+                chunkLoadingQueue = [];
+                
+                // Regenerate immediately
                 generateTerrain();
             }
             // Normal chunk update when player moves to a new chunk
             else if (playerChunkX !== player.lastChunkX || playerChunkZ !== player.lastChunkZ) {
+                console.log(`Player moved to new chunk: ${playerChunkX},${playerChunkZ} (from ${player.lastChunkX},${player.lastChunkZ})`);
                 player.lastChunkX = playerChunkX;
                 player.lastChunkZ = playerChunkZ;
                 generateTerrain();
@@ -2182,15 +2627,23 @@
             // Update player physics
             updatePlayer(delta);
             
+            // Update chunk fade transitions
+            updateChunkFades(delta);
+            
+            // Try to process the next chunk in the queue (if we're not already processing one)
+            if (!processingChunk && chunkLoadingQueue.length > 0) {
+                processChunkQueue();
+            }
+            
             // Update day/night cycle
             updateDayNightCycle(delta);
-            // updateHighlyOptimizedLights(delta);
+            
             // Update block highlighting
             updateBlockHighlight();
             
             // Only render if the game is active
             if (isGameStarted) {
-                renderer.render(scene, camera);
+            renderer.render(scene, camera);
             }
             
             // Update block selector based on inventory changes
@@ -2814,6 +3267,18 @@
             chunkCountDisplay.textContent = 'Chunks: 0';
             statsContainer.appendChild(chunkCountDisplay);
             
+            // Queue display
+            const queueDisplay = document.createElement('div');
+            queueDisplay.id = 'queueDisplay';
+            queueDisplay.textContent = 'Queue: 0';
+            statsContainer.appendChild(queueDisplay);
+            
+            // Cache display
+            const cacheDisplay = document.createElement('div');
+            cacheDisplay.id = 'cacheDisplay';
+            cacheDisplay.textContent = 'Cached: 0';
+            statsContainer.appendChild(cacheDisplay);
+            
             // Performance mode toggle button
             const perfButton = document.createElement('button');
             perfButton.textContent = 'High Performance Mode';
@@ -2831,8 +3296,13 @@
                 highPerfMode = !highPerfMode;
                 
                 if (highPerfMode) {
-                    // Reduce view distance for better performance
-                    viewDistance = 1;
+                    // Reduce render distances for better performance
+                    chunkRenderDistance.minimum = 1;
+                    chunkRenderDistance.ideal = 1;
+                    chunkRenderDistance.maximum = 2;
+                    chunkRenderDistance.preloadFar = 2;
+                    maxCachedChunks = 100; // Reduce cache size in performance mode
+                    
                     // Reduce fog distance
                     scene.fog.near = 10;
                     scene.fog.far = 30;
@@ -2840,7 +3310,12 @@
                     perfButton.style.background = '#553300';
                 } else {
                     // Restore normal settings
-                    viewDistance = 2;
+                    chunkRenderDistance.minimum = 1;
+                    chunkRenderDistance.ideal = 2;
+                    chunkRenderDistance.maximum = 3;
+                    chunkRenderDistance.preloadFar = 4;
+                    maxCachedChunks = 500; // Normal cache size
+                    
                     // Restore fog
                     scene.fog.near = 15;
                     scene.fog.far = 45;
@@ -2848,19 +3323,26 @@
                     perfButton.style.background = '#333';
                 }
                 
-                // Force terrain update with new view distance
-                Object.keys(terrain).forEach(chunkKey => {
-                    disposeChunk(terrain[chunkKey]);
-                    scene.remove(terrain[chunkKey]);
-                    delete terrain[chunkKey];
-                });
+                // Force terrain update with new render distances
                 generateTerrain();
             });
             
             statsContainer.appendChild(perfButton);
             
             // Update stats periodically
-            setInterval(updateMemoryStats, 1000);
+            setInterval(() => {
+                updateMemoryStats();
+                
+                // Update queue display
+                if (document.getElementById('queueDisplay')) {
+                    document.getElementById('queueDisplay').textContent = `Queue: ${chunkLoadingQueue.length}`;
+                }
+                
+                // Update cache display
+                if (document.getElementById('cacheDisplay')) {
+                    document.getElementById('cacheDisplay').textContent = `Cached: ${Object.keys(chunkCache).length}`;
+                }
+            }, 1000);
         }
         
         // Function to update memory statistics
@@ -3986,6 +4468,195 @@
             
             // Clamp score between 1-5
             return Math.max(1, Math.min(5, Math.round(score)));
+        }
+
+        // Update all chunk fade transitions
+        function updateChunkFades(delta) {
+            Object.values(terrain).forEach(chunk => {
+                if (!chunk.userData) return;
+                
+                // Handle fade in
+                if (chunk.userData.fadeState === 'in' && chunk.userData.fadeProgress < 1) {
+                    chunk.userData.fadeProgress += chunk.userData.fadeSpeed;
+                    
+                    if (chunk.userData.fadeProgress >= 1) {
+                        chunk.userData.fadeProgress = 1;
+                        chunk.userData.fadeState = 'visible';
+                        chunk.userData.fullyLoaded = true;
+                        
+                        // Fix materials after fade completes
+                        chunk.traverse(object => {
+                            if (object.material && object.material.transparent) {
+                                object.material.opacity = 1;
+                                
+                                // Only turn off transparency if the material should be fully opaque
+                                if (object.material.type !== 'MeshLambertMaterial' || 
+                                    !object.material._originalOpacity || 
+                                    object.material._originalOpacity >= 1) {
+                                    object.material.transparent = false;
+                                    object.material.needsUpdate = true;
+                                }
+                            }
+                        });
+                    } else {
+                        // Update opacity during fade
+                        const opacity = chunk.userData.fadeProgress;
+                        chunk.traverse(object => {
+                            if (object.material) {
+                                if (!object.material.transparent) {
+                                    object.material.transparent = true;
+                                    // Store original opacity if it exists
+                                    if (typeof object.material.opacity !== 'undefined') {
+                                        object.material._originalOpacity = object.material.opacity;
+                                    }
+                                }
+                                object.material.opacity = opacity * (object.material._originalOpacity || 1);
+                                object.material.needsUpdate = true;
+                            }
+                        });
+                    }
+                }
+                
+                // Handle fade out
+                else if (chunk.userData.fadeState === 'out' && chunk.userData.fadeProgress > 0) {
+                    chunk.userData.fadeProgress -= chunk.userData.fadeSpeed * 2; // Faster fade out
+                    
+                    if (chunk.userData.fadeProgress <= 0) {
+                        chunk.userData.fadeProgress = 0;
+                        
+                        // Remove the chunk when fade out is complete
+                        disposeChunk(chunk);
+                        scene.remove(chunk);
+                        
+                        // Find and remove from terrain object
+                        Object.keys(terrain).forEach(key => {
+                            if (terrain[key] === chunk) {
+                                delete terrain[key];
+                            }
+                        });
+                    } else {
+                        // Update opacity during fade
+                        const opacity = chunk.userData.fadeProgress;
+                        chunk.traverse(object => {
+                            if (object.material) {
+                                if (!object.material.transparent) {
+                                    object.material.transparent = true;
+                                }
+                                object.material.opacity = opacity * (object.material._originalOpacity || 1);
+                                object.material.needsUpdate = true;
+                            }
+                        });
+                    }
+                }
+            });
+        }
+
+        // Process the next chunk in the loading queue
+        function processChunkQueue() {
+            // If already processing or queue is empty, exit
+            if (processingChunk || chunkLoadingQueue.length === 0) return;
+            
+            // Sort queue by priority and then by distance to player
+            chunkLoadingQueue.sort((a, b) => {
+                // Primary sort by priority (higher priority first)
+                if (a.priority !== b.priority) {
+                    return b.priority - a.priority;
+                }
+                
+                // Secondary sort by distance to player (closer first)
+                const playerChunkX = Math.floor(player.position.x / chunkSize);
+                const playerChunkZ = Math.floor(player.position.z / chunkSize);
+                
+                const distA = Math.max(Math.abs(a.x - playerChunkX), Math.abs(a.z - playerChunkZ));
+                const distB = Math.max(Math.abs(b.x - playerChunkX), Math.abs(b.z - playerChunkZ));
+                
+                return distA - distB;
+            });
+            
+            // Get the highest priority chunk
+            const nextChunk = chunkLoadingQueue.shift();
+            processingChunk = true;
+            
+            // Use setTimeout to spread the load across frames
+            setTimeout(() => {
+                try {
+                    // Check if chunk still needs to be generated
+                    const chunkKey = `${nextChunk.x},${nextChunk.z}`;
+                    
+                    // Make sure this chunk doesn't already exist in active terrain
+                    if (!terrain[chunkKey]) {
+                        // Generate the chunk
+                        generateChunk(nextChunk.x, nextChunk.z, nextChunk.priority, nextChunk.fadeIn);
+                    }
+                } catch (error) {
+                    console.error("Error processing chunk:", error);
+                } finally {
+                    processingChunk = false;
+                    
+                    // Continue processing the queue
+                    if (chunkLoadingQueue.length > 0) {
+                        processChunkQueue();
+                    }
+                }
+            }, 0);
+        }
+
+        // Calculate player movement direction for predictive loading
+        function updatePlayerDirection() {
+            const now = performance.now();
+            
+            // Only update direction periodically to avoid jitter
+            if (now - lastDirectionUpdateTime < 500) return;
+            
+            // Calculate movement direction
+            if (previousPlayerPosition.distanceToSquared(player.position) > 0.01) {
+                playerDirection.subVectors(player.position, previousPlayerPosition).normalize();
+                previousPlayerPosition.copy(player.position);
+                lastDirectionUpdateTime = now;
+            }
+        }
+
+        // Apply stored player modifications to a cached chunk
+        function applyChunkModifications(chunkKey, chunkGroup) {
+            const mods = chunkModifications[chunkKey];
+            if (!mods) return;
+            
+            console.log(`Applying ${Object.keys(mods).length} modifications to chunk ${chunkKey}`);
+            
+            // Apply each modification to the chunk
+            for (const [posKey, mod] of Object.entries(mods)) {
+                const [x, y, z] = posKey.split(',').map(Number);
+                
+                if (mod.action === 'add') {
+                    // Add a block
+                    if (!chunkGroup.blockPositions[posKey]) {
+                        chunkGroup.blockPositions[posKey] = {
+                            type: mod.blockType,
+                            index: Object.keys(chunkGroup.blockPositions).length
+                        };
+                        
+                        // Create the actual mesh
+                        const material = blockMaterials[mod.blockType] || blockMaterials.stone;
+                        const mesh = new THREE.Mesh(blockGeometry, material.clone());
+                        mesh.position.set(x, y, z);
+                        chunkGroup.add(mesh);
+                    }
+                } else if (mod.action === 'remove') {
+                    // Remove a block
+                    delete chunkGroup.blockPositions[posKey];
+                    
+                    // Find and remove any matching mesh
+                    for (let i = chunkGroup.children.length - 1; i >= 0; i--) {
+                        const blockMesh = chunkGroup.children[i];
+                        if (Math.abs(blockMesh.position.x - x) < 0.1 && 
+                            Math.abs(blockMesh.position.y - y) < 0.1 && 
+                            Math.abs(blockMesh.position.z - z) < 0.1) {
+                            chunkGroup.remove(blockMesh);
+                            break;
+                        }
+                    }
+                }
+            }
         }
     </script>
 </body>
