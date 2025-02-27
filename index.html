@@ -387,7 +387,9 @@
             lastChunkZ: 0,
             spawnHeight: 100, // Safe initial height
             isSpawning: true, // Flag to indicate initial spawn
-            spawned: false // Flag to track if player has safely spawned
+            spawned: false, // Flag to track if player has safely spawned
+            lastGlobalX: null,
+            lastGlobalZ: null
         };
         let keyboard = {};
         let raycaster = new THREE.Raycaster();
@@ -871,6 +873,21 @@
             const playerChunkZ = Math.floor(player.position.z / chunkSize);
             const distanceFromPlayer = Math.max(Math.abs(chunkX - playerChunkX), Math.abs(chunkZ - playerChunkZ));
             
+            // For optimized rendering, batch blocks by material
+            const blocksByMaterial = {};
+            
+            // Function to add a block to the batch
+            function addToBatch(worldX, y, worldZ, blockType) {
+                if (!blocksByMaterial[blockType]) {
+                    blocksByMaterial[blockType] = [];
+                }
+                blocksByMaterial[blockType].push({ x: worldX, y, z: worldZ });
+                
+                // Store position for collision detection
+                const posKey = `${worldX},${y},${worldZ}`;
+                chunkGroup.blockPositions[posKey] = { type: blockType };
+            }
+            
             // Generate blocks in chunk based on deterministic noise
             for (let x = 0; x < chunkSize; x++) {
                 for (let z = 0; z < chunkSize; z++) {
@@ -881,10 +898,12 @@
                     const height = getTerrainHeight(worldX, worldZ, currentBiome);
                     
                     // Determine how deep to render based on distance (LOD)
-                    const renderDepth = distanceFromPlayer === 0 ? 15 : 5;
+                    // More aggressive depth reduction for better performance
+                    const renderDepth = distanceFromPlayer === 0 ? 8 : 
+                                       (distanceFromPlayer === 1 ? 4 : 2);
                     
-                    // Generate blocks from bedrock to surface
-                    for (let y = 0; y < height; y++) {
+                    // Generate blocks from surface to calculated depth
+                    for (let y = height - 1; y > height - renderDepth && y >= 0; y--) {
                         // Determine block type based on height and biome with more natural distribution
                         let blockType;
                         
@@ -956,15 +975,7 @@
                             // Subsurface layers
                             if (currentBiome === 'desert') {
                                 // Add some variation to subsurface sand too
-                                const depthNoise = simplex.noise2D(worldX * 0.03, worldZ * 0.03);
-                                
-                                if (depthNoise > 0.7) {
-                                    blockType = 'sand_gold';
-                                } else if (depthNoise < -0.7) {
-                                    blockType = 'sand_red';
-                                } else {
-                                    blockType = 'sand';
-                                }
+                                blockType = 'sand';
                             } else if (currentBiome === 'mountains') {
                                 if (y > 50) {
                                     blockType = 'snow'; // Snow layers under surface
@@ -989,146 +1000,81 @@
                             blockType = 'stone';
                         }
                         
-                        // Only create blocks near the surface to improve performance
-                        if (y > height - renderDepth) {
-                            createBlock(worldX, y, worldZ, blockType, chunkGroup);
-                        }
-                        
-                        // Always store position for collision detection
-                        const posKey = `${worldX},${y},${worldZ}`;
-                        chunkGroup.blockPositions[posKey] = { type: blockType };
+                        // Add to the appropriate material batch instead of creating individual blocks
+                        addToBatch(worldX, y, worldZ, blockType);
                     }
                     
-                    // Add biome-specific features with deterministic placement
-                    // Use a deterministic seed for features so they don't change when we regenerate chunks
-                    const featureSeed = worldX * 10000 + worldZ;
-                    const featureRandom = seededRandom(featureSeed);
-                    
-                    if (distanceFromPlayer <= 1) {
+                    // Add biome-specific features with deterministic placement only in close chunks
+                    if (distanceFromPlayer === 0) {
+                        // Use a deterministic seed for features so they don't change when we regenerate chunks
+                        const featureSeed = worldX * 10000 + worldZ;
+                        const featureRandom = seededRandom(featureSeed);
+                        
                         // FOREST FEATURES
                         if (currentBiome === 'forest' && featureRandom() < 0.03 && height > 5) {
                             createTree(worldX, height, worldZ, chunkGroup);
                         }
                         
-                        // DESERT FEATURES
+                        // DESERT FEATURES - simplify to reduce object count
                         if (currentBiome === 'desert') {
-                            // Add sand dune transitions
                             const dunePattern = simplex.noise2D(worldX * 0.03, worldZ * 0.03);
                             if (dunePattern > 0.7 && height > 9) {
-                                // Create dune crest with lighter sand extending upward
-                                createBlock(worldX, height, worldZ, 'sand_light', chunkGroup);
-                                const duneKey = `${worldX},${height},${worldZ}`;
-                                chunkGroup.blockPositions[duneKey] = { type: 'sand_light' };
-                            }
-                            
-                            // Add occasional red sand patches
-                            if (featureRandom() < 0.05 && dunePattern < -0.5) {
-                                // Create a small patch of red sand
-                                for (let dx = -1; dx <= 1; dx++) {
-                                    for (let dz = -1; dz <= 1; dz++) {
-                                        const distance = Math.sqrt(dx*dx + dz*dz);
-                                        if (distance <= 1.5) {
-                                            const redSandHeight = getTerrainHeight(worldX + dx, worldZ + dz, currentBiome);
-                                            createBlock(worldX + dx, redSandHeight, worldZ + dz, 'sand_red', chunkGroup);
-                                            const redSandKey = `${worldX + dx},${redSandHeight},${worldZ + dz}`;
-                                            chunkGroup.blockPositions[redSandKey] = { type: 'sand_red' };
-                                        }
-                                    }
-                                }
+                                // Add single dune crest blocks instead of complex structures
+                                addToBatch(worldX, height, worldZ, 'sand_light');
                             }
                         }
                         
-                        // MOUNTAIN FEATURES
-                        if (currentBiome === 'mountains') {
-                            // Add random boulders in mountain biome
-                            if (featureRandom() < 0.04 && height < 50 && height > 25) {
-                                // Large and small boulders to add character
-                                const boulderSize = Math.floor(1 + featureRandom() * 2);
-                                for (let bx = 0; bx < boulderSize; bx++) {
-                                    for (let by = 0; by < boulderSize; by++) {
-                                        for (let bz = 0; bz < boulderSize; bz++) {
-                                            // Create roughly spherical boulder
-                                            const distance = Math.sqrt(
-                                                Math.pow(bx - boulderSize/2, 2) + 
-                                                Math.pow(by - boulderSize/2, 2) + 
-                                                Math.pow(bz - boulderSize/2, 2)
-                                            );
-                                            if (distance <= boulderSize/2) {
-                                                createBlock(worldX + bx, height + by, worldZ + bz, 'stone', chunkGroup);
-                                                const posKey = `${worldX + bx},${height + by},${worldZ + bz}`;
-                                                chunkGroup.blockPositions[posKey] = { type: 'stone' };
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                            
-                            // Add small alpine plants in mountain biome at middle elevations
-                            if (featureRandom() < 0.1 && height < 45 && height > 30) {
-                                createBlock(worldX, height, worldZ, 'grass', chunkGroup);
-                                const posKey = `${worldX},${height},${worldZ}`;
-                                chunkGroup.blockPositions[posKey] = { type: 'grass' };
-                            }
+                        // MOUNTAIN FEATURES - simplify
+                        if (currentBiome === 'mountains' && featureRandom() < 0.02 && height < 50 && height > 30) {
+                            // Just add some stone variation rather than complex structures
+                            addToBatch(worldX, height, worldZ, 'stone');
                         }
                         
-                        // PLAINS FEATURES
+                        // PLAINS FEATURES - simplify
                         if (currentBiome === 'plains') {
-                            // Check if we're not in or very near the river
                             const riverNoise = Math.abs(simplex.noise2D(worldX * 0.02, worldZ * 0.02));
-                            
-                            if (riverNoise >= 0.12) {
-                                // Add scattered trees (much less dense than forest)
-                                if (featureRandom() < 0.005 && height > 10) {
-                                    createTree(worldX, height, worldZ, chunkGroup);
-                                }
-                                
-                                // Add tall grass and flowers
-                                if (featureRandom() < 0.2 && height > 10) {
-                                    // Choose between grass and flowers based on another random
-                                    if (featureRandom() < 0.3) {
-                                        // Create a flower (just a different colored block for now)
-                                        const flowerType = featureRandom() < 0.5 ? 'yellow_flower' : 'red_flower';
-                                        createFlower(worldX, height, worldZ, flowerType, chunkGroup);
-                                    } else {
-                                        // Create tall grass
-                                        createTallGrass(worldX, height, worldZ, chunkGroup);
-                                    }
-                                }
-                                
-                                // Add occasional rock formations
-                                if (featureRandom() < 0.01 && height > 10) {
-                                    // Small rock formation
-                                    const rockSize = 1 + Math.floor(featureRandom() * 1.5);
-                                    for (let rx = 0; rx < rockSize; rx++) {
-                                        for (let ry = 0; ry < rockSize; ry++) {
-                                            for (let rz = 0; rz < rockSize; rz++) {
-                                                if (featureRandom() < 0.7) { // Makes rocks more irregular
-                                                    createBlock(worldX + rx, height + ry, worldZ + rz, 'stone', chunkGroup);
-                                                    const posKey = `${worldX + rx},${height + ry},${worldZ + rz}`;
-                                                    chunkGroup.blockPositions[posKey] = { type: 'stone' };
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                            } else if (riverNoise < 0.06) {
-                                // Add occasional water lilies on river
-                                if (featureRandom() < 0.05 && height <= 8) {
-                                    createWaterLily(worldX, 9, worldZ, chunkGroup);
-                                }
-                                
-                                // Add occasional reeds along riverbank
-                                if (riverNoise >= 0.04 && riverNoise < 0.06 && featureRandom() < 0.3) {
-                                    createReed(worldX, height + 1, worldZ, chunkGroup);
-                                }
-                            }
-                            
-                            // Add ponds away from rivers
-                            if (riverNoise > 0.3 && featureRandom() < 0.002) {
-                                createPond(worldX, height, worldZ, chunkGroup);
+                            if (riverNoise >= 0.12 && featureRandom() < 0.001 && height > 10) {
+                                createTree(worldX, height, worldZ, chunkGroup);
                             }
                         }
                     }
+                }
+            }
+            
+            // Now create instanced meshes for each material type
+            for (const [blockType, positions] of Object.entries(blocksByMaterial)) {
+                if (positions.length === 0) continue;
+                
+                // Get the material for this block type
+                const material = blockMaterials[blockType] || blockMaterials.stone;
+                
+                // If there are lots of blocks, use instancing for better performance
+                if (positions.length > 10) {
+                    const instancedMesh = new THREE.InstancedMesh(
+                        blockGeometry,
+                        material.clone(), // Clone material to avoid shared material issues
+                        positions.length
+                    );
+                    
+                    // Set matrix for each instance
+                    const matrix = new THREE.Matrix4();
+                    for (let i = 0; i < positions.length; i++) {
+                        const pos = positions[i];
+                        matrix.setPosition(pos.x, pos.y, pos.z);
+                        instancedMesh.setMatrixAt(i, matrix);
+                    }
+                    
+                    // Update the instance buffer
+                    instancedMesh.instanceMatrix.needsUpdate = true;
+                    chunkGroup.add(instancedMesh);
+                } 
+                // For a small number of blocks, regular meshes are fine
+                else {
+                    positions.forEach(pos => {
+                        const mesh = new THREE.Mesh(blockGeometry, material);
+                        mesh.position.set(pos.x, pos.y, pos.z);
+                        chunkGroup.add(mesh);
+                    });
                 }
             }
             
@@ -1290,14 +1236,42 @@
             const playerChunkX = Math.floor(player.position.x / chunkSize);
             const playerChunkZ = Math.floor(player.position.z / chunkSize);
             
+            // Track which chunks should remain active
+            const activeChunks = new Set();
+            
             // Generate chunks around player
             for (let x = -viewDistance; x <= viewDistance; x++) {
                 for (let z = -viewDistance; z <= viewDistance; z++) {
                     const chunkX = playerChunkX + x;
                     const chunkZ = playerChunkZ + z;
+                    const chunkKey = `${chunkX},${chunkZ}`;
+                    
+                    // Add to active chunks set
+                    activeChunks.add(chunkKey);
+                    
+                    // Generate the chunk if it doesn't exist
                     generateChunk(chunkX, chunkZ);
                 }
             }
+            
+            // Remove chunks that are too far from the player
+            Object.keys(terrain).forEach(chunkKey => {
+                if (!activeChunks.has(chunkKey)) {
+                    // Properly dispose of the chunk's geometries and materials to free memory
+                    const chunk = terrain[chunkKey];
+                    
+                    // Recursively dispose of all meshes, geometries, and materials in the chunk
+                    disposeChunk(chunk);
+                    
+                    // Remove from scene
+                    scene.remove(chunk);
+                    
+                    // Delete from terrain object
+                    delete terrain[chunkKey];
+                    
+                    console.log(`Removed distant chunk: ${chunkKey}`);
+                }
+            });
             
             // If this is initial spawn, check for a safe position
             if (player.isSpawning) {
@@ -1316,23 +1290,28 @@
                 }, 100);
             }
         }
-        
-        // Find ground level at given x,z coordinates
-        function findGroundLevel(x, z) {
-            // Start from high up and scan down
-            for (let y = 100; y >= 0; y--) {
-                const posKey = `${Math.floor(x)},${y},${Math.floor(z)}`;
+
+        // Function to properly dispose of a chunk's resources
+        function disposeChunk(chunk) {
+            // Skip if chunk is not valid
+            if (!chunk) return;
+            
+            // Traverse all children in the chunk
+            chunk.traverse(object => {
+                // Dispose of geometries
+                if (object.geometry) {
+                    object.geometry.dispose();
+                }
                 
-                // Check all chunks for this position
-                for (const chunk of Object.values(terrain)) {
-                    if (chunk.blockPositions[posKey]) {
-                        return y + 1; // Return position above the ground
+                // Dispose of materials (could be an array or a single material)
+                if (object.material) {
+                    if (Array.isArray(object.material)) {
+                        object.material.forEach(material => material.dispose());
+                    } else {
+                        object.material.dispose();
                     }
                 }
-            }
-            
-            // No ground found
-            return -1;
+            });
         }
         
         // Set up scene lighting with improved balance
@@ -1963,7 +1942,32 @@
             const playerChunkX = Math.floor(player.position.x / chunkSize);
             const playerChunkZ = Math.floor(player.position.z / chunkSize);
             
-            if (playerChunkX !== player.lastChunkX || playerChunkZ !== player.lastChunkZ) {
+            // Track very large changes in position for chunk management
+            if (!player.lastGlobalX) player.lastGlobalX = player.position.x;
+            if (!player.lastGlobalZ) player.lastGlobalZ = player.position.z;
+            
+            // If player has moved a large distance, reset terrain completely
+            const distanceMoved = Math.sqrt(
+                Math.pow(player.position.x - player.lastGlobalX, 2) +
+                Math.pow(player.position.z - player.lastGlobalZ, 2)
+            );
+            
+            if (distanceMoved > chunkSize * viewDistance * 2) {
+                console.log("Player moved a large distance, resetting terrain completely");
+                player.lastGlobalX = player.position.x;
+                player.lastGlobalZ = player.position.z;
+                
+                // Clear all chunks and regenerate terrain
+                Object.keys(terrain).forEach(chunkKey => {
+                    disposeChunk(terrain[chunkKey]);
+                    scene.remove(terrain[chunkKey]);
+                    delete terrain[chunkKey];
+                });
+                
+                generateTerrain();
+            }
+            // Normal chunk update when player moves to a new chunk
+            else if (playerChunkX !== player.lastChunkX || playerChunkZ !== player.lastChunkZ) {
                 player.lastChunkX = playerChunkX;
                 player.lastChunkZ = playerChunkZ;
                 generateTerrain();
@@ -2166,6 +2170,11 @@
                 fpsDisplay.textContent = `FPS: ${framesThisSecond}`;
                 framesThisSecond = 0;
                 lastFpsUpdate = now;
+                
+                // Update chunk count in the stats display
+                if (chunkCountDisplay) {
+                    chunkCountDisplay.textContent = `Chunks: ${Object.keys(terrain).length}`;
+                }
             }
             
             const delta = Math.min(clock.getDelta(), 0.1); // Cap delta time to prevent jumps
@@ -2181,7 +2190,7 @@
             
             // Only render if the game is active
             if (isGameStarted) {
-            renderer.render(scene, camera);
+                renderer.render(scene, camera);
             }
             
             // Update block selector based on inventory changes
@@ -2765,25 +2774,121 @@
         let fpsDisplay;
         let lastFpsUpdate = 0;
         let framesThisSecond = 0;
+        let memoryDisplay;
+        let lastMemoryUpdate = 0;
+        let chunkCountDisplay;
 
         // Add this function to init() before the end
         function createFpsCounter() {
-            // Create FPS display element
+            // Create stats container
+            const statsContainer = document.createElement('div');
+            statsContainer.id = 'statsContainer';
+            statsContainer.style.position = 'fixed';
+            statsContainer.style.top = '10px';
+            statsContainer.style.left = '10px';
+            statsContainer.style.background = 'rgba(0, 0, 0, 0.7)';
+            statsContainer.style.color = '#00FF00';
+            statsContainer.style.padding = '5px 10px';
+            statsContainer.style.borderRadius = '5px';
+            statsContainer.style.fontFamily = 'monospace';
+            statsContainer.style.fontSize = '14px';
+            statsContainer.style.fontWeight = 'bold';
+            statsContainer.style.zIndex = '9999';
+            statsContainer.style.display = 'flex';
+            statsContainer.style.flexDirection = 'column';
+            statsContainer.style.gap = '5px';
+            document.body.appendChild(statsContainer);
+            
+            // FPS display
             fpsDisplay = document.createElement('div');
-            fpsDisplay.id = 'fpsCounter';
-            fpsDisplay.style.position = 'fixed';
-            fpsDisplay.style.top = '10px';
-            fpsDisplay.style.left = '10px';
-            fpsDisplay.style.background = 'rgba(0, 0, 0, 0.7)';
-            fpsDisplay.style.color = '#00FF00'; // Bright green for better visibility
-            fpsDisplay.style.padding = '5px 10px';
-            fpsDisplay.style.borderRadius = '5px';
-            fpsDisplay.style.fontFamily = 'monospace';
-            fpsDisplay.style.fontSize = '16px';
-            fpsDisplay.style.fontWeight = 'bold';
-            fpsDisplay.style.zIndex = '9999'; // Ensure it's always on top
             fpsDisplay.textContent = 'FPS: 0';
-            document.body.appendChild(fpsDisplay);
+            statsContainer.appendChild(fpsDisplay);
+            
+            // Memory usage display
+            memoryDisplay = document.createElement('div');
+            memoryDisplay.textContent = 'Memory: N/A';
+            statsContainer.appendChild(memoryDisplay);
+            
+            // Chunk count display
+            chunkCountDisplay = document.createElement('div');
+            chunkCountDisplay.textContent = 'Chunks: 0';
+            statsContainer.appendChild(chunkCountDisplay);
+            
+            // Performance mode toggle button
+            const perfButton = document.createElement('button');
+            perfButton.textContent = 'High Performance Mode';
+            perfButton.style.marginTop = '5px';
+            perfButton.style.background = '#333';
+            perfButton.style.color = 'white';
+            perfButton.style.border = '1px solid #555';
+            perfButton.style.borderRadius = '3px';
+            perfButton.style.cursor = 'pointer';
+            perfButton.style.padding = '3px 6px';
+            perfButton.style.fontSize = '12px';
+            
+            let highPerfMode = false;
+            perfButton.addEventListener('click', () => {
+                highPerfMode = !highPerfMode;
+                
+                if (highPerfMode) {
+                    // Reduce view distance for better performance
+                    viewDistance = 1;
+                    // Reduce fog distance
+                    scene.fog.near = 10;
+                    scene.fog.far = 30;
+                    perfButton.textContent = 'Normal Mode';
+                    perfButton.style.background = '#553300';
+                } else {
+                    // Restore normal settings
+                    viewDistance = 2;
+                    // Restore fog
+                    scene.fog.near = 15;
+                    scene.fog.far = 45;
+                    perfButton.textContent = 'High Performance Mode';
+                    perfButton.style.background = '#333';
+                }
+                
+                // Force terrain update with new view distance
+                Object.keys(terrain).forEach(chunkKey => {
+                    disposeChunk(terrain[chunkKey]);
+                    scene.remove(terrain[chunkKey]);
+                    delete terrain[chunkKey];
+                });
+                generateTerrain();
+            });
+            
+            statsContainer.appendChild(perfButton);
+            
+            // Update stats periodically
+            setInterval(updateMemoryStats, 1000);
+        }
+        
+        // Function to update memory statistics
+        function updateMemoryStats() {
+            if (!memoryDisplay || !chunkCountDisplay) return;
+            
+            // Update chunk count
+            const chunkCount = Object.keys(terrain).length;
+            chunkCountDisplay.textContent = `Chunks: ${chunkCount}`;
+            
+            // Update memory usage if available
+            if (window.performance && window.performance.memory) {
+                const memUsed = Math.round(window.performance.memory.usedJSHeapSize / 1048576);
+                const memTotal = Math.round(window.performance.memory.jsHeapSizeLimit / 1048576);
+                memoryDisplay.textContent = `Memory: ${memUsed}MB / ${memTotal}MB`;
+                
+                // Change color based on memory usage
+                const memPercentage = memUsed / memTotal;
+                if (memPercentage > 0.8) {
+                    memoryDisplay.style.color = '#FF5555'; // Red for high usage
+                } else if (memPercentage > 0.6) {
+                    memoryDisplay.style.color = '#FFAA55'; // Orange for medium usage
+                } else {
+                    memoryDisplay.style.color = '#55FF55'; // Green for low usage
+                }
+            } else {
+                memoryDisplay.textContent = 'Memory: N/A';
+            }
         }
 
         // Enhanced Chunk class with expanded LOD system
