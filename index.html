@@ -898,18 +898,22 @@
                 const chunkGroup = chunkCache[chunkKey];
                 delete chunkCache[chunkKey]; // Remove from cache to avoid duplication
                 
+                // Update the cache display
+                updateCacheDisplay();
+                
                 // Setup fade in if needed
                 if (fadeIn) {
                     chunkGroup.visible = true;
-                    chunkGroup.userData = {
-                        fadeState: 'in',
-                        fadeProgress: 0,
-                        fadeSpeed: 0.05,
-                        fullyLoaded: false,
-                        chunkX: chunkX,
-                        chunkZ: chunkZ,
-                        lastAccessed: Date.now()
-                    };
+                    
+                    // Preserve existing userData if possible, or create new
+                    chunkGroup.userData = chunkGroup.userData || {};
+                    chunkGroup.userData.fadeState = 'in';
+                    chunkGroup.userData.fadeProgress = 0;
+                    chunkGroup.userData.fadeSpeed = 0.05;
+                    chunkGroup.userData.fullyLoaded = false;
+                    chunkGroup.userData.chunkX = chunkX;
+                    chunkGroup.userData.chunkZ = chunkZ;
+                    chunkGroup.userData.lastAccessed = Date.now();
                     
                     // Set all materials to be transparent for fading
                     chunkGroup.traverse(object => {
@@ -923,14 +927,14 @@
                         }
                     });
                 } else {
-                    chunkGroup.userData = {
-                        fadeState: 'visible',
-                        fadeProgress: 1,
-                        fullyLoaded: true,
-                        chunkX: chunkX,
-                        chunkZ: chunkZ,
-                        lastAccessed: Date.now()
-                    };
+                    // Preserve existing userData if possible, or create new
+                    chunkGroup.userData = chunkGroup.userData || {};
+                    chunkGroup.userData.fadeState = 'visible';
+                    chunkGroup.userData.fadeProgress = 1;
+                    chunkGroup.userData.fullyLoaded = true;
+                    chunkGroup.userData.chunkX = chunkX;
+                    chunkGroup.userData.chunkZ = chunkZ;
+                    chunkGroup.userData.lastAccessed = Date.now();
                 }
                 
                 // Add the chunk to the scene
@@ -1070,7 +1074,7 @@
                                     }
                                     break;
                                 case 'plains':
-                                    // Check for river or pond
+                                    // Check for river path using noise
                                     const riverNoise = Math.abs(simplex.noise2D(worldX * 0.02, worldZ * 0.02));
                                     if (riverNoise < 0.05 && y <= 8) {
                                         blockType = 'water'; // River water
@@ -1111,7 +1115,7 @@
                                 // River bottom is sandy
                                 const riverNoise = Math.abs(simplex.noise2D(worldX * 0.02, worldZ * 0.02));
                                 if (riverNoise < 0.05) {
-                                    blockType = 'sand';
+                                    blockType = 'water';
                                 } else {
                                     blockType = 'dirt';
                                 }
@@ -1386,10 +1390,20 @@
                     scene.remove(terrain[chunkKey]);
                     delete terrain[chunkKey];
                 });
+                
+                // Also clear cache when respawning
+                Object.keys(chunkCache).forEach(chunkKey => {
+                    disposeChunk(chunkCache[chunkKey]);
+                    delete chunkCache[chunkKey];
+                });
+                
                 terrain = {};
                 chunkCache = {}; // Also clear the cache
                 chunkModifications = {}; // Clear modifications
                 chunkLoadingQueue = []; // Clear the loading queue
+                
+                // Update display
+                updateCacheDisplay();
             }
             
             // Get player chunk position
@@ -1436,12 +1450,14 @@
                     
                     // Generate immediately and with no fade for close chunks
                     if (!terrain[chunkKey]) {
-                        console.log(`Immediate generation of chunk ${chunkKey}`);
-                        const newChunk = generateChunk(chunkX, chunkZ, 3, false);
-                        if (newChunk) {
-                            console.log(`Successfully generated chunk ${chunkKey}`);
+                        // Check if it's in cache first
+                        if (chunkCache[chunkKey]) {
+                            console.log(`Restoring close chunk from cache: ${chunkKey}`);
+                            const newChunk = generateChunk(chunkX, chunkZ, 3, false);
+                            updateCacheDisplay(); // Update cache counter after restoration
                         } else {
-                            console.log(`Failed to generate chunk ${chunkKey}`);
+                            console.log(`Immediate generation of chunk ${chunkKey}`);
+                            const newChunk = generateChunk(chunkX, chunkZ, 3, false);
                         }
                     } else {
                         // Update last accessed time for this chunk
@@ -1579,6 +1595,11 @@
                         chunk.userData.fadeProgress = 1;
                         chunk.userData.targetCache = true; // Mark for caching instead of removal
                         
+                        // Make sure we have lastAccessed set
+                        if (!chunk.userData.lastAccessed) {
+                            chunk.userData.lastAccessed = Date.now();
+                        }
+                        
                         // Make sure material is set up for fading
                         chunk.traverse(object => {
                             if (object.material) {
@@ -1602,7 +1623,12 @@
             processChunkQueue();
             
             // If cache is getting too large, prune the oldest chunks
-            pruneChunkCache();
+            if (Object.keys(chunkCache).length > maxCachedChunks) {
+                pruneChunkCache();
+            }
+            
+            // Update the cache display
+            updateCacheDisplay();
             
             // If this is initial spawn, check for a safe position
             if (player.isSpawning) {
@@ -1622,7 +1648,7 @@
             }
         }
         
-        // Function to remove old chunks from cache when it gets too large
+        // Improved function to remove old chunks from cache when it gets too large
         function pruneChunkCache() {
             const cacheSize = Object.keys(chunkCache).length;
             if (cacheSize <= maxCachedChunks) return;
@@ -1631,10 +1657,14 @@
             
             // Convert cache to array for sorting
             const chunks = Object.entries(chunkCache).map(([key, chunk]) => {
+                const lastAccessed = chunk.userData && chunk.userData.lastAccessed 
+                    ? chunk.userData.lastAccessed 
+                    : 0;
+                
                 return {
                     key: key,
                     chunk: chunk,
-                    lastAccessed: chunk.userData ? chunk.userData.lastAccessed || 0 : 0
+                    lastAccessed: lastAccessed
                 };
             });
             
@@ -1644,19 +1674,75 @@
             // Remove oldest chunks until we're back under the limit
             const toRemove = cacheSize - maxCachedChunks;
             for (let i = 0; i < toRemove; i++) {
-                const chunk = chunks[i];
-                console.log(`Removing old chunk from cache: ${chunk.key}, last accessed: ${new Date(chunk.lastAccessed).toLocaleTimeString()}`);
-                disposeChunk(chunk.chunk);
-                delete chunkCache[chunk.key];
+                if (i < chunks.length) {
+                    const chunk = chunks[i];
+                    console.log(`Removing old chunk from cache: ${chunk.key}, last accessed: ${new Date(chunk.lastAccessed).toLocaleTimeString()}`);
+                    disposeChunk(chunk.chunk);
+                    delete chunkCache[chunk.key];
+                }
             }
             
             console.log(`Cache pruned. New size: ${Object.keys(chunkCache).length}`);
+            updateCacheDisplay();
         }
 
-        // Update all chunk fade transitions with caching
+        // Replace the disposeChunk function with an improved version
+        function disposeChunk(chunk) {
+            if (!chunk) return;
+            
+            try {
+                // Properly dispose of all materials and geometries
+                chunk.traverse((object) => {
+                    if (object.geometry) {
+                        object.geometry.dispose();
+                    }
+                    
+                    if (object.material) {
+                        // Handle both array of materials and single material
+                        if (Array.isArray(object.material)) {
+                            object.material.forEach(material => {
+                                if (material) {
+                                    material.dispose();
+                                }
+                            });
+                        } else {
+                            // Handle single material
+                            object.material.dispose();
+                        }
+                    }
+                    
+                    // If it's an instanced mesh, dispose instanceMatrix
+                    if (object.isInstancedMesh && object.instanceMatrix) {
+                        object.instanceMatrix.dispose();
+                    }
+                });
+                
+                // Clear children array
+                chunk.children.length = 0;
+                
+                // Clear blockPositions to free memory
+                if (chunk.blockPositions) {
+                    chunk.blockPositions = {};
+                }
+            } catch (e) {
+                console.error("Error disposing chunk:", e);
+            }
+        }
+
+        // Function to update cache display
+        function updateCacheDisplay() {
+            const cacheDisplay = document.getElementById('cacheDisplay');
+            if (cacheDisplay) {
+                const cacheCount = Object.keys(chunkCache).length;
+                cacheDisplay.textContent = `Cached: ${cacheCount}`;
+            }
+        }
+
+        // Improved function to update chunk fade transitions with better caching
         function updateChunkFades(delta) {
-            Object.values(terrain).forEach(chunk => {
-                if (!chunk.userData) return;
+            Object.keys(terrain).forEach(chunkKey => {
+                const chunk = terrain[chunkKey];
+                if (!chunk || !chunk.userData) return;
                 
                 // Handle fade in
                 if (chunk.userData.fadeState === 'in' && chunk.userData.fadeProgress < 1) {
@@ -1707,32 +1793,33 @@
                     if (chunk.userData.fadeProgress <= 0) {
                         chunk.userData.fadeProgress = 0;
                         
-                        // Find chunk key
-                        let chunkKey = null;
-                        for (const key in terrain) {
-                            if (terrain[key] === chunk) {
-                                chunkKey = key;
-                                break;
-                            }
-                        }
-                        
-                        // If the chunk is marked for caching and we have a valid key, move it to cache
-                        if (chunk.userData.targetCache && chunkKey) {
+                        // Move chunk to cache if it's marked for caching
+                        if (chunk.userData.targetCache) {
                             console.log(`Moving chunk to cache: ${chunkKey}`);
-                            // Store in cache instead of disposing
+                            
+                            // Make sure lastAccessed is set before caching
+                            if (!chunk.userData.lastAccessed) {
+                                chunk.userData.lastAccessed = Date.now() - 60000; // Set to 1 minute ago as baseline
+                            }
+                            
+                            // Store in cache
                             scene.remove(chunk);
                             chunkCache[chunkKey] = chunk;
                             delete terrain[chunkKey];
+                            
+                            // Update the cache display immediately
+                            updateCacheDisplay();
+                            
+                            // Check if we need to prune the cache after adding this chunk
+                            if (Object.keys(chunkCache).length > maxCachedChunks) {
+                                pruneChunkCache();
+                            }
                         } else {
-                            console.log(`Disposing chunk: ${chunkKey || 'unknown'}`);
+                            console.log(`Disposing chunk: ${chunkKey}`);
                             // Remove the chunk completely
                             disposeChunk(chunk);
                             scene.remove(chunk);
-                            
-                            // Find and remove from terrain object
-                            if (chunkKey) {
-                                delete terrain[chunkKey];
-                            }
+                            delete terrain[chunkKey];
                         }
                     } else {
                         // Update opacity during fade
@@ -1951,6 +2038,10 @@
         
         // Initialize the game with optimized settings
         function init() {
+            // Add this line to set the maximum number of cached chunks based on detected performance
+            maxCachedChunks = estimateHardwarePerformance() >= 4 ? 500 : 200;
+            console.log(`Setting maximum cached chunks to ${maxCachedChunks} based on hardware performance`);
+            
             // Create Three.js scene
             scene = new THREE.Scene();
             scene.background = new THREE.Color(0x87CEEB); // Sky blue
@@ -2630,10 +2721,16 @@
                     chunkCountDisplay.textContent = `Chunks: ${Object.keys(terrain).length}`;
                 }
                 
+                // Update cache display
+                updateCacheDisplay();
+                
                 // Periodically check for world borders to ensure continuous generation
                 if (isGameStarted) {
                     detectAndExpandWorldBorder();
                 }
+                
+                // Periodically check and prune the chunk cache
+                pruneChunkCache();
             }
             
             const delta = Math.min(clock.getDelta(), 0.1); // Cap delta time to prevent jumps
@@ -4815,6 +4912,15 @@
             
             // Return true if we added any new border chunks
             return newBorderChunks.length > 0;
+        }
+
+        // Add this function after the pruneChunkCache function
+        function updateCacheDisplay() {
+            const cacheDisplay = document.getElementById('cacheDisplay');
+            if (cacheDisplay) {
+                const cacheCount = Object.keys(chunkCache).length;
+                cacheDisplay.textContent = `Cached: ${cacheCount}`;
+            }
         }
     </script>
 </body>
