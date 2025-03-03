@@ -346,6 +346,11 @@
             <span>Wood</span>
         </div>
     </div>
+    
+    <!-- World expansion indicator -->
+    <div id="worldExpansionIndicator" style="display: none; position: absolute; top: 60px; left: 20px; background: rgba(0, 0, 0, 0.5); color: yellow; padding: 10px; border-radius: 5px; z-index: 10;">
+        Expanding World...
+    </div>
 
     <!-- Crafting Interface -->
     <div id="craftingUI">
@@ -389,7 +394,8 @@
             minimum: 1,  // Minimum render distance (closest to player)
             ideal: 2,    // Standard render distance
             maximum: 3,  // Maximum render distance (for pre-loading)
-            preloadFar: 4 // Distance to load low-detail chunks ahead of player
+            preloadFar: 4, // Distance to load low-detail chunks ahead of player
+            borderExpansion: 6  // Distance for world border expansion (should be > preloadFar)
         };
         let chunkCache = {}; // Cache for storing chunk data even when not visible
         let maxCachedChunks = 500; // Maximum number of chunks to keep in cache
@@ -1548,6 +1554,9 @@
                 }
             }
             
+            // Pass 5: Detect world border and expand beyond it for continuous generation
+            detectAndExpandWorldBorder();
+            
             // Log active chunks for debugging
             console.log(`Active chunks: ${activeChunks.size}`);
             
@@ -2619,6 +2628,11 @@
                 // Update chunk count in the stats display
                 if (chunkCountDisplay) {
                     chunkCountDisplay.textContent = `Chunks: ${Object.keys(terrain).length}`;
+                }
+                
+                // Periodically check for world borders to ensure continuous generation
+                if (isGameStarted) {
+                    detectAndExpandWorldBorder();
                 }
             }
             
@@ -4556,11 +4570,37 @@
             // If already processing or queue is empty, exit
             if (processingChunk || chunkLoadingQueue.length === 0) return;
             
+            // Ensure player direction is updated for prioritization
+            updatePlayerDirection();
+            
             // Sort queue by priority and then by distance to player
             chunkLoadingQueue.sort((a, b) => {
                 // Primary sort by priority (higher priority first)
                 if (a.priority !== b.priority) {
                     return b.priority - a.priority;
+                }
+                
+                // For border chunks, prioritize those in player's direction of travel
+                if (a.isBorderChunk && b.isBorderChunk && (playerDirection.x !== 0 || playerDirection.z !== 0)) {
+                    const playerChunkX = Math.floor(player.position.x / chunkSize);
+                    const playerChunkZ = Math.floor(player.position.z / chunkSize);
+                    
+                    // Calculate direction vectors to each chunk
+                    const dirA = { 
+                        x: a.x - playerChunkX, 
+                        z: a.z - playerChunkZ 
+                    };
+                    const dirB = { 
+                        x: b.x - playerChunkX, 
+                        z: b.z - playerChunkZ 
+                    };
+                    
+                    // Calculate dot products with player direction to determine alignment
+                    const dotA = (dirA.x * playerDirection.x) + (dirA.z * playerDirection.z);
+                    const dotB = (dirB.x * playerDirection.x) + (dirB.z * playerDirection.z);
+                    
+                    // Higher dot product means better alignment with player direction
+                    return dotB - dotA;
                 }
                 
                 // Secondary sort by distance to player (closer first)
@@ -4657,6 +4697,124 @@
                     }
                 }
             }
+        }
+
+        // Function to detect world border and expand it
+        function detectAndExpandWorldBorder() {
+            const playerChunkX = Math.floor(player.position.x / chunkSize);
+            const playerChunkZ = Math.floor(player.position.z / chunkSize);
+            
+            // Check all four directions (N, S, E, W) to detect world borders
+            const directions = [
+                { x: 1, z: 0, name: "East" },  // East
+                { x: -1, z: 0, name: "West" }, // West
+                { x: 0, z: 1, name: "South" }, // South
+                { x: 0, z: -1, name: "North" }  // North
+            ];
+            
+            // Track newly added border chunks for debugging
+            const newBorderChunks = [];
+            
+            // Check each direction for world border
+            directions.forEach(dir => {
+                // Look for the current furthest generated chunk in this direction
+                let furthestDistance = 0;
+                let foundBorder = false;
+                
+                // Scan outward in this direction to find the border
+                for (let dist = chunkRenderDistance.maximum; dist <= chunkRenderDistance.borderExpansion; dist++) {
+                    const checkX = playerChunkX + (dir.x * dist);
+                    const checkZ = playerChunkZ + (dir.z * dist);
+                    
+                    // Check chunks in a line perpendicular to our search direction
+                    const perpendicularSize = 3; // Check a few chunks to the sides as well
+                    
+                    for (let offset = -perpendicularSize; offset <= perpendicularSize; offset++) {
+                        // Calculate perpendicular offset position
+                        const offsetX = dir.x === 0 ? offset : 0;
+                        const offsetZ = dir.z === 0 ? offset : 0;
+                        
+                        const testChunkX = checkX + offsetX;
+                        const testChunkZ = checkZ + offsetZ;
+                        const testChunkKey = `${testChunkX},${testChunkZ}`;
+                        
+                        if (!terrain[testChunkKey] && !chunkCache[testChunkKey] && 
+                            !chunkLoadingQueue.some(c => c.x === testChunkX && c.z === testChunkZ)) {
+                            
+                            // We found a border - there's no chunk here
+                            furthestDistance = dist;
+                            foundBorder = true;
+                            
+                            // No need to check further in this direction
+                            break;
+                        }
+                    }
+                    
+                    if (foundBorder) break;
+                }
+                
+                // If we found a border and it's close to the player, expand the world in this direction
+                if (foundBorder && furthestDistance <= chunkRenderDistance.borderExpansion) {
+                    const expansionStart = furthestDistance;
+                    const expansionEnd = chunkRenderDistance.borderExpansion;
+                    
+                    // Generate chunks beyond the border to expand the world
+                    for (let dist = expansionStart; dist <= expansionEnd; dist++) {
+                        // How wide to make the expansion - wider at closer distances
+                        const expansionWidth = Math.max(2, Math.floor((expansionEnd - dist) / 2) + 1);
+                        
+                        // Create a row of chunks at this distance
+                        for (let offset = -expansionWidth; offset <= expansionWidth; offset++) {
+                            // Calculate perpendicular offset position
+                            const offsetX = dir.x === 0 ? offset : 0;
+                            const offsetZ = dir.z === 0 ? offset : 0;
+                            
+                            const newChunkX = playerChunkX + (dir.x * dist) + offsetX;
+                            const newChunkZ = playerChunkZ + (dir.z * dist) + offsetZ;
+                            const newChunkKey = `${newChunkX},${newChunkZ}`;
+                            
+                            // Only add if chunk doesn't exist and isn't already queued
+                            if (!terrain[newChunkKey] && !chunkCache[newChunkKey] && 
+                                !chunkLoadingQueue.some(c => c.x === newChunkX && c.z === newChunkZ)) {
+                                
+                                // Calculate priority based on distance
+                                const priority = Math.max(0, chunkRenderDistance.borderExpansion - dist);
+                                
+                                // Add to loading queue
+                                chunkLoadingQueue.push({
+                                    x: newChunkX,
+                                    z: newChunkZ,
+                                    priority: priority,
+                                    fadeIn: true,
+                                    isBorderChunk: true
+                                });
+                                
+                                newBorderChunks.push(newChunkKey);
+                            }
+                        }
+                    }
+                    
+                    // Debugging: Log border expansion
+                    if (newBorderChunks.length > 0) {
+                        console.log(`Expanding world border ${dir.name}: Added ${newBorderChunks.length} new chunks beyond distance ${furthestDistance}`);
+                    }
+                }
+            });
+            
+            // Show or hide the world expansion indicator
+            const expansionIndicator = document.getElementById('worldExpansionIndicator');
+            if (expansionIndicator && newBorderChunks.length > 0) {
+                // Show the indicator when world is expanding
+                expansionIndicator.style.display = 'block';
+                
+                // Hide it after a short delay
+                setTimeout(() => {
+                    expansionIndicator.style.display = 'none';
+                }, 3000);
+            }
+            
+            // Return true if we added any new border chunks
+            return newBorderChunks.length > 0;
         }
     </script>
 </body>
