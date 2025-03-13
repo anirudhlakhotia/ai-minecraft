@@ -346,6 +346,32 @@
             font-size: 16px;
             margin-top: 10px;
         }
+
+        /* Pause overlay styles */
+        #pauseOverlay {
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            display: none;
+            flex-direction: column;
+            justify-content: center;
+            align-items: center;
+            background: rgba(0, 0, 0, 0.5);
+            color: white;
+            z-index: 998;
+        }
+
+        #pauseOverlay h2 {
+            font-size: 28px;
+            margin-bottom: 15px;
+        }
+
+        #pauseOverlay p {
+            font-size: 18px;
+            margin-bottom: 10px;
+        }
     </style>
 </head>
 <body>
@@ -364,6 +390,11 @@
             <div id="loadingProgress"></div>
         </div>
         <div id="loadingStatus">Initializing...</div>
+    </div>
+
+    <div id="pauseOverlay">
+        <h2>Game Paused</h2>
+        <p>Press ESC or click anywhere to return to the game</p>
     </div>
 
     <div id="crosshair"></div>
@@ -948,11 +979,12 @@
                 if (!chunk || !chunk.isObject3D || !chunk.children || chunk.children.length === 0) {
                     console.warn(`Invalid chunk found in cache at ${chunkKey}, removing it`);
                     delete chunkCache[chunkKey];
-                    traceCacheOperation("INVALID_REMOVED", chunkKey);
+                    traceCacheOperation("INVALID_REMOVED", chunkKey, true);
                     return false;
                 }
                 
-                traceCacheOperation("FOUND", chunkKey);
+                // Call traceCacheOperation but with logging disabled for performance
+                traceCacheOperation("FOUND", chunkKey, false);
                 return true;
             }
             
@@ -981,6 +1013,13 @@
                     // The chunk was found by isChunkInCache but couldn't be retrieved
                     // This should never happen, but just in case...
                     return generateChunk(chunkX, chunkZ, priority, fadeIn);
+                }
+                
+                // Verify block positions were properly restored
+                if (!chunkGroup.blockPositions || Object.keys(chunkGroup.blockPositions).length === 0) {
+                    console.warn(`Retrieved chunk ${chunkKey} has no block positions, it may not work correctly`);
+                } else {
+                    console.log(`Retrieved chunk ${chunkKey} with ${Object.keys(chunkGroup.blockPositions).length} block positions`);
                 }
                 
                 // Setup fade in if needed
@@ -1863,6 +1902,8 @@
                                 }
                             }
                         });
+                        
+                        console.log(`Chunk ${chunkKey} has completed fading in`);
                     } else {
                         // Update opacity during fade
                         const opacity = chunk.userData.fadeProgress;
@@ -1892,6 +1933,13 @@
                         // Move chunk to cache if it's marked for caching
                         if (chunk.userData.targetCache) {
                             console.log(`Moving chunk to cache: ${chunkKey}`);
+                            
+                            // Make sure the chunk isn't already in the cache
+                            if (chunkCache[chunkKey]) {
+                                console.warn(`WARNING: Chunk ${chunkKey} already exists in cache. Disposing duplicate.`);
+                                disposeChunk(chunkCache[chunkKey]);
+                                delete chunkCache[chunkKey];
+                            }
                             
                             // Ensure chunk has correct metadata
                             const [cx, cz] = chunkKey.split(',').map(Number);
@@ -2011,6 +2059,8 @@
                 controls.unlock();
                 document.getElementById('instructions').style.display = 'none';
                 document.getElementById('uiModeMessage').style.display = 'block';
+                // Don't show the pause overlay when just toggling UI mode
+                document.getElementById('pauseOverlay').style.display = 'none';
             } else {
                 controls.lock();
                 document.getElementById('uiModeMessage').style.display = 'none';
@@ -2252,26 +2302,37 @@
             controls.addEventListener('lock', () => {
                 document.getElementById('instructions').style.display = 'none';
                 document.getElementById('uiModeMessage').style.display = 'none';
+                
+                // Resume game if it was previously paused
+                if (!isGameStarted && document.getElementById('pauseOverlay').style.display === 'flex') {
+                    togglePauseOverlay(false);
+                }
             });
             
             controls.addEventListener('unlock', () => {
-                if (!isGameStarted) {
-                    document.getElementById('instructions').style.display = 'flex';
+                if (!isGameStarted && document.getElementById('loadingScreen').style.display !== 'flex') {
+                    // Only show instructions at initial startup, not when pausing
+                    if (document.getElementById('pauseOverlay').style.display !== 'flex') {
+                        document.getElementById('instructions').style.display = 'flex';
+                    }
                 }
             });
             
             // Add Tab key to toggle UI mode
             document.addEventListener('keydown', function(event) {
-                if (event.key === 'Escape' && isGameStarted) {
-                    controls.unlock();
-                    document.getElementById('instructions').style.display = 'flex';
-                    isGameStarted = false;
-                    
-                    // Pause all ambient sounds
-                    try {
-                        Object.values(ambientSounds).forEach(sound => sound.pause());
-                    } catch (e) {
-                        console.error("Error pausing sounds:", e);
+                if (event.key === 'Escape') {
+                    // If game is running, pause it
+                    if (isGameStarted) {
+                        controls.unlock();
+                        togglePauseOverlay(true);
+                    }
+                    // If game is paused (overlay is visible), unpause it
+                    else if (document.getElementById('pauseOverlay').style.display === 'flex') {
+                        togglePauseOverlay(false);
+                        // Small delay before locking controls to ensure the DOM updates first
+                        setTimeout(() => {
+                            controls.lock();
+                        }, 50);
                     }
                 }
                 
@@ -2876,6 +2937,17 @@
 
         // Initialize the game when the page loads
         window.addEventListener('DOMContentLoaded', () => {
+            // Add click event to pause overlay to unpause
+            document.getElementById('pauseOverlay').addEventListener('click', function() {
+                if (this.style.display === 'flex') {
+                    togglePauseOverlay(false);
+                    // Small delay before locking controls to ensure the DOM updates first
+                    setTimeout(() => {
+                        controls.lock();
+                    }, 50);
+                }
+            });
+            
             console.log("DOM loaded, initializing game");
             try {
                 init();
@@ -4694,115 +4766,6 @@
             return Math.max(1, Math.min(5, Math.round(score)));
         }
 
-        // Update all chunk fade transitions
-        function updateChunkFades(delta) {
-            Object.values(terrain).forEach(chunk => {
-                if (!chunk.userData) return;
-                
-                // Handle fade in
-                if (chunk.userData.fadeState === 'in' && chunk.userData.fadeProgress < 1) {
-                    chunk.userData.fadeProgress += chunk.userData.fadeSpeed;
-                    
-                    if (chunk.userData.fadeProgress >= 1) {
-                        chunk.userData.fadeProgress = 1;
-                        chunk.userData.fadeState = 'visible';
-                        chunk.userData.fullyLoaded = true;
-                        
-                        // Fix materials after fade completes
-                        chunk.traverse(object => {
-                            if (object.material && object.material.transparent) {
-                                object.material.opacity = 1;
-                                
-                                // Only turn off transparency if the material should be fully opaque
-                                if (object.material.type !== 'MeshLambertMaterial' || 
-                                    !object.material._originalOpacity || 
-                                    object.material._originalOpacity >= 1) {
-                                    object.material.transparent = false;
-                                    object.material.needsUpdate = true;
-                                }
-                            }
-                        });
-                    } else {
-                        // Update opacity during fade
-                        const opacity = chunk.userData.fadeProgress;
-                        chunk.traverse(object => {
-                            if (object.material) {
-                                if (!object.material.transparent) {
-                                    object.material.transparent = true;
-                                    // Store original opacity if it exists
-                                    if (typeof object.material.opacity !== 'undefined') {
-                                        object.material._originalOpacity = object.material.opacity;
-                                    }
-                                }
-                                object.material.opacity = opacity * (object.material._originalOpacity || 1);
-                                object.material.needsUpdate = true;
-                            }
-                        });
-                    }
-                }
-                
-                // Handle fade out
-                else if (chunk.userData.fadeState === 'out' && chunk.userData.fadeProgress > 0) {
-                    chunk.userData.fadeProgress -= chunk.userData.fadeSpeed * 2; // Faster fade out
-                    
-                    if (chunk.userData.fadeProgress <= 0) {
-                        chunk.userData.fadeProgress = 0;
-                        
-                        // Move chunk to cache if it's marked for caching
-                        if (chunk.userData.targetCache) {
-                            console.log(`Moving chunk to cache: ${chunkKey}`);
-                            
-                            // Ensure chunk has correct metadata
-                            const [cx, cz] = chunkKey.split(',').map(Number);
-                            chunk.userData.chunkX = cx;
-                            chunk.userData.chunkZ = cz;
-                            chunk.userData.lastAccessed = Date.now();
-                            
-                            // Reset materials for future reuse
-                            chunk.traverse(object => {
-                                if (object.material) {
-                                    object.material.transparent = false;
-                                    object.material.opacity = 1;
-                                    object.material.needsUpdate = true;
-                                }
-                            });
-                            
-                            // CRITICAL: Remove from scene BEFORE adding to cache
-                            scene.remove(chunk);
-                            
-                            // Add to cache using CURRENT key, not computed key
-                            chunkCache[chunkKey] = chunk;
-                            
-                            // CRITICAL: Now remove from terrain AFTER adding to cache
-                            delete terrain[chunkKey];
-                            
-                            console.log(`Added chunk to cache, new size: ${Object.keys(chunkCache).length}`);
-                            updateCacheDisplay();
-                        } else {
-                            console.log(`Disposing chunk: ${chunkKey}`);
-                            // Remove the chunk completely
-                            disposeChunk(chunk);
-                            scene.remove(chunk);
-                            delete terrain[chunkKey];
-                        }
-                    } else {
-                        // Update opacity during fade
-                        const opacity = chunk.userData.fadeProgress;
-                        chunk.traverse(object => {
-                            if (object.material) {
-                                if (!object.material.transparent) {
-                                    object.material.transparent = true;
-                                }
-                                object.material.opacity = opacity * (object.material._originalOpacity || 1);
-                                object.material.needsUpdate = true;
-                            }
-                        });
-                    }
-                }
-            });
-        }
-
-        // Process the next chunk in the loading queue
         function processChunkQueue() {
             // If already processing or queue is empty, exit
             if (processingChunk || chunkLoadingQueue.length === 0) return;
@@ -5052,15 +5015,6 @@
             
             // Return true if we added any new border chunks
             return newBorderChunks.length > 0;
-        }
-
-        // Add this function after the pruneChunkCache function
-        function updateCacheDisplay() {
-            const cacheDisplay = document.getElementById('cacheDisplay');
-            if (cacheDisplay) {
-                const cacheCount = Object.keys(chunkCache).length;
-                cacheDisplay.textContent = `Cached: ${cacheCount}`;
-            }
         }
 
         function updateChunksAroundPlayer(highPriority = false) {
@@ -5331,13 +5285,14 @@
         }, 3000);
 
         // Add a function to trace cache operations
-        function traceCacheOperation(operation, chunkKey) {
+        function traceCacheOperation(operation, chunkKey, shouldLog = false) {
             const cacheSize = Object.keys(chunkCache).length;
             const activeChunks = Object.keys(terrain).length;
-            console.log(`CACHE ${operation}: ${chunkKey} | Cache size: ${cacheSize} | Active chunks: ${activeChunks}`);
             
-            // Print stack trace to help identify where the operation is happening
-            console.trace();
+            // Only log if shouldLog is true (reduces console spam)
+            if (shouldLog) {
+                console.log(`CACHE ${operation}: ${chunkKey} | Cache size: ${cacheSize} | Active chunks: ${activeChunks}`);
+            }
             
             // Update the display
             updateCacheDisplay();
@@ -5362,6 +5317,15 @@
                 chunk.userData.chunkZ = chunkZ;
             }
             
+            // CRITICAL: Ensure blockPositions exists and has content
+            if (!chunk.blockPositions) {
+                console.warn(`Creating missing blockPositions for chunk ${chunkKey} before caching`);
+                chunk.blockPositions = {};
+            }
+            
+            // Save blockPositions data to userData as a backup
+            chunk.userData._blockPositionsBackup = JSON.parse(JSON.stringify(chunk.blockPositions));
+            
             // Prepare materials for caching (reset opacity and transparency)
             chunk.traverse(object => {
                 if (object.material) {
@@ -5384,8 +5348,8 @@
             const cacheChunkKey = `${chunk.userData.chunkX},${chunk.userData.chunkZ}`;
             chunkCache[cacheChunkKey] = chunk;
             
-            // Log the operation
-            console.log(`CACHE ADD: ${cacheChunkKey} | Total cached: ${Object.keys(chunkCache).length}`);
+            // Log detailed information about the cached chunk
+            console.log(`CACHE ADD: ${cacheChunkKey} | Size: ${Object.keys(chunkCache).length} | BlockPositions: ${Object.keys(chunk.blockPositions).length}`);
             
             // Update the display
             updateCacheDisplay();
@@ -5402,19 +5366,33 @@
             
             const chunk = chunkCache[chunkKey];
             
-            // Validation to ensure the chunk is valid
-            if (!chunk || !chunk.isObject3D) {
-                console.error(`Invalid chunk in cache at ${chunkKey}`);
+            // More thorough validation to ensure the chunk is valid
+            if (!chunk || !chunk.isObject3D || !chunk.children || chunk.children.length === 0) {
+                console.error(`Invalid chunk in cache at ${chunkKey}, it will be removed`);
                 delete chunkCache[chunkKey];
                 updateCacheDisplay();
                 return null;
             }
             
-            // Remove from cache
+            // Ensure blockPositions object exists by restoring from backup if needed
+            if (!chunk.blockPositions || Object.keys(chunk.blockPositions).length === 0) {
+                if (chunk.userData && chunk.userData._blockPositionsBackup) {
+                    console.log(`Restoring blockPositions for chunk ${chunkKey} from backup`);
+                    chunk.blockPositions = JSON.parse(JSON.stringify(chunk.userData._blockPositionsBackup));
+                } else {
+                    console.warn(`Creating empty blockPositions for chunk ${chunkKey} - no backup available`);
+                    chunk.blockPositions = {};
+                }
+            }
+            
+            // Log information about the retrieved chunk
+            console.log(`Retrieved chunk ${chunkKey} from cache with ${Object.keys(chunk.blockPositions).length} block positions`);
+            
+            // Remove from cache (only need to do this once)
             delete chunkCache[chunkKey];
             
-            // Remove from cache
-            delete chunkCache[chunkKey];
+            // Update cache display
+            updateCacheDisplay();
             
             return chunk;
         }
@@ -5443,8 +5421,8 @@
 
         // Add a comprehensive chunk caching system
         window.chunkCachingSystem = {
-            // The actual cache storage
-            cache: {},
+            // Use the global chunkCache instead of a separate cache object
+            get cache() { return chunkCache; },
             
             // Stats for monitoring
             stats: {
@@ -5466,47 +5444,34 @@
                 // Create the chunk key
                 const chunkKey = `${chunkX},${chunkZ}`;
                 
-                // Make sure the chunk has proper userData
-                if (!chunk.userData) {
-                    chunk.userData = {};
+                // Just use the regular addChunkToCache function to ensure consistency
+                return addChunkToCache(chunk, chunkKey);
+            },
+            
+            // Get a chunk from the cache
+            getChunk: function(chunkX, chunkZ) {
+                const chunkKey = `${chunkX},${chunkZ}`;
+                this.stats.cacheHits++;
+                return getChunkFromCache(chunkKey);
+            },
+            
+            // Check if a chunk is in the cache
+            hasChunk: function(chunkX, chunkZ) {
+                const chunkKey = `${chunkX},${chunkZ}`;
+                const result = isChunkInCache(chunkX, chunkZ);
+                
+                if (result) {
+                    this.stats.cacheHits++;
+                } else {
+                    this.stats.cacheMisses++;
                 }
                 
-                // Set or update chunk coordinates in userData if not present
-                if (!chunk.userData.chunkX || !chunk.userData.chunkZ) {
-                    const [chunkX, chunkZ] = chunkKey.split(',').map(Number);
-                    chunk.userData.chunkX = chunkX;
-                    chunk.userData.chunkZ = chunkZ;
-                }
-                
-                // Prepare materials for caching (reset opacity and transparency)
-                chunk.traverse(object => {
-                    if (object.material) {
-                        object.material.opacity = 1;
-                        object.material.transparent = false;
-                        object.material.needsUpdate = true;
-                    }
-                });
-                
-                // Set last accessed time
-                chunk.userData.lastAccessed = Date.now();
-                chunk.userData.fadeState = 'cached';
-                
-                // Remove from scene if it's still there
-                if (chunk.parent) {
-                    scene.remove(chunk);
-                }
-                
-                // Store in cache with chunk key from coordinates (not original key which might be different)
-                const cacheChunkKey = `${chunk.userData.chunkX},${chunk.userData.chunkZ}`;
-                chunkCache[cacheChunkKey] = chunk;
-                
-                // Log the operation
-                console.log(`CACHE ADD: ${cacheChunkKey} | Total cached: ${Object.keys(chunkCache).length}`);
-                
-                // Update the display
-                updateCacheDisplay();
-                
-                return true;
+                return result;
+            },
+            
+            // Reset the cache
+            reset: function() {
+                return resetCacheSystem();
             }
         };
 
@@ -5519,7 +5484,10 @@
             testChunk.userData = {
                 chunkX: 9999,
                 chunkZ: 9999,
-                lastAccessed: Date.now()
+                lastAccessed: Date.now(),
+                fadeState: 'cached',
+                fadeProgress: 1,
+                fullyLoaded: true
             };
             
             // Add a simple mesh to the test chunk
@@ -5529,25 +5497,68 @@
             );
             testChunk.add(mesh);
             
+            // Add blockPositions with some test data
+            testChunk.blockPositions = {
+                "10,5,10": { type: "grass" },
+                "11,5,10": { type: "dirt" },
+                "10,5,11": { type: "stone" }
+            };
+            
             // Add to cache
             const testKey = "9999,9999";
             console.log(`Adding test chunk to cache with key: ${testKey}`);
-            chunkCache[testKey] = testChunk;
+            
+            // Use addChunkToCache instead of direct assignment
+            addChunkToCache(testChunk, testKey);
             
             // Check if it was added
             console.log(`Cache size after adding: ${Object.keys(chunkCache).length}`);
             console.log(`Is test chunk in cache? ${testKey in chunkCache}`);
             
-            // Try to retrieve it
-            const retrievedChunk = chunkCache[testKey];
+            // Check if the backup was created properly
+            if (chunkCache[testKey].userData._blockPositionsBackup) {
+                const backupCount = Object.keys(chunkCache[testKey].userData._blockPositionsBackup).length;
+                console.log(`BlockPositions backup created with ${backupCount} entries`);
+            } else {
+                console.error("No blockPositions backup was created!");
+            }
+            
+            // Try to retrieve it with our actual retrieval method
+            const retrievedChunk = getChunkFromCache(testKey);
+            
             if (retrievedChunk) {
                 console.log("Successfully retrieved test chunk from cache");
+                console.log("Retrieved chunk has blockPositions:", !!retrievedChunk.blockPositions);
                 
-                // Remove from cache
-                delete chunkCache[testKey];
-                console.log(`Cache size after removing: ${Object.keys(chunkCache).length}`);
+                // Count blockPositions to ensure they were preserved
+                const blockPosCount = Object.keys(retrievedChunk.blockPositions).length;
+                console.log(`Retrieved chunk has ${blockPosCount} block positions`);
+                
+                if (blockPosCount === 3) {
+                    console.log("PASS: All block positions were correctly preserved!");
+                    
+                    // Check specific entries
+                    console.log("Block at 10,5,10:", retrievedChunk.blockPositions["10,5,10"]);
+                    console.log("Block at 11,5,10:", retrievedChunk.blockPositions["11,5,10"]);
+                    console.log("Block at 10,5,11:", retrievedChunk.blockPositions["10,5,11"]);
+                } else {
+                    console.error(`FAIL: Expected 3 block positions, but found ${blockPosCount}`);
+                }
+                
+                console.log("Retrieved chunk has children:", retrievedChunk.children.length > 0);
+                
+                // Test complete - if we got here, the cache is working for basic operations
+                console.log("CACHE SYSTEM WORKING CORRECTLY FOR BASIC OPERATIONS");
             } else {
-                console.error("Failed to retrieve test chunk from cache");
+                console.error("CRITICAL ERROR: Failed to retrieve test chunk from cache");
+                
+                // The cache system is broken, try to diagnose why
+                if (testKey in chunkCache) {
+                    console.error("Chunk still exists in cache after getChunkFromCache call");
+                    console.error("This indicates getChunkFromCache isn't correctly removing items");
+                } else {
+                    console.error("Chunk was removed from cache but not returned correctly");
+                }
             }
             
             console.log("===== CACHE TEST COMPLETE =====");
@@ -5573,6 +5584,70 @@
 
         // Call this periodically
         setInterval(debugCacheSystem, 5000);
+
+        // Call test function earlier in the process
+        window.addEventListener('DOMContentLoaded', () => {
+            // Run our test immediately to verify caching is working
+            setTimeout(() => {
+                console.log("Running cache system test...");
+                testCacheSystem();
+            }, 1000);
+        });
+
+        // Add a function to show/hide the pause overlay
+        function togglePauseOverlay(show) {
+            const pauseOverlay = document.getElementById('pauseOverlay');
+            
+            if (show) {
+                pauseOverlay.style.display = 'flex';
+                isGameStarted = false;
+                
+                // Pause all ambient sounds
+                try {
+                    Object.values(ambientSounds).forEach(sound => sound.pause());
+                } catch (e) {
+                    console.error("Error pausing sounds:", e);
+                }
+            } else {
+                pauseOverlay.style.display = 'none';
+                isGameStarted = true;
+                
+                // Resume ambient sounds
+                try {
+                    playAmbientSound(currentBiome);
+                } catch (e) {
+                    console.error("Error resuming sounds:", e);
+                }
+                
+                // Make sure the UI is in the correct state
+                document.getElementById('instructions').style.display = 'none';
+                document.getElementById('loadingScreen').style.display = 'none';
+                document.getElementById('uiModeMessage').style.display = 'none';
+                
+                // Force a render frame to update the display
+                forceGameUpdate();
+            }
+        }
+        
+        // Function to force a game update when resuming from pause
+        function forceGameUpdate() {
+            // Reset the delta time to prevent large physics jumps
+            clock.getDelta();
+            
+            // Force several frames to refresh everything
+            for (let i = 0; i < 3; i++) {
+                // Update physics and state
+                updatePlayer(0.016); // Approximately 60fps
+                updateChunkFades(0.016);
+                updateDayNightCycle(0.016);
+                updateBlockHighlight();
+                
+                // Render the scene
+                renderer.render(scene, camera);
+            }
+            
+            console.log("Forced game update after unpause");
+        }
     </script>
 </body>
 </html>
