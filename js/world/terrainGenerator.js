@@ -113,7 +113,7 @@ export function createTreeAt(x, surfaceY, z, parentChunkGroup, modifications) {
 					x + lx,
 					surfaceY + trunkHeight + ly - 1,
 					z + lz,
-					"grass", // Leaves are grass type
+					"leaves", // Leaves are grass type
 					parentChunkGroup,
 					modifications
 				);

@@ -7,6 +7,21 @@ export const VIEW_DISTANCE_MAX = 3;
 export const VIEW_DISTANCE_PRELOAD_FAR = 4;
 export const VIEW_DISTANCE_BORDER_EXPANSION = 6;
 
+// Active view distances (mutable)
+export let currentViewDistanceMin = VIEW_DISTANCE_MIN;
+export let currentViewDistanceIdeal = VIEW_DISTANCE_IDEAL;
+export let currentViewDistanceMax = VIEW_DISTANCE_MAX;
+export let currentViewDistancePreloadFar = VIEW_DISTANCE_PRELOAD_FAR;
+export let currentViewDistanceBorderExpansion = VIEW_DISTANCE_BORDER_EXPANSION;
+
+export function updateActiveViewDistances(min, ideal, max, preloadFar, borderExpansion) {
+	currentViewDistanceMin = min;
+	currentViewDistanceIdeal = ideal;
+	currentViewDistanceMax = max;
+	currentViewDistancePreloadFar = preloadFar;
+	currentViewDistanceBorderExpansion = borderExpansion;
+}
+
 export let MAX_CACHED_CHUNKS = 500; // Can be adjusted by performance monitor
 
 export const DAY_NIGHT_DURATION = 300; // 5 minutes per cycle
@@ -16,32 +31,36 @@ export const blockGeometry = new THREE.BoxGeometry(1, 1, 1);
 
 // Block materials
 export const blockMaterials = {
-	grass: new THREE.MeshLambertMaterial({ color: 0x3a9d23 }),
-	dirt: new THREE.MeshLambertMaterial({ color: 0x59472b }),
-	stone: new THREE.MeshLambertMaterial({ color: 0x666666 }),
-	sand: new THREE.MeshLambertMaterial({ color: 0xdbc681 }),
-	sand_light: new THREE.MeshLambertMaterial({ color: 0xe8d9a0 }),
-	sand_red: new THREE.MeshLambertMaterial({ color: 0xc2a477 }),
-	sand_gold: new THREE.MeshLambertMaterial({ color: 0xd4b16a }),
-	sand_dark: new THREE.MeshLambertMaterial({ color: 0xb49b6c }),
-	wood: new THREE.MeshLambertMaterial({ color: 0x52341d }),
-	snow: new THREE.MeshLambertMaterial({ color: 0xf5f5f5 }),
-	water: new THREE.MeshLambertMaterial({
+	grass: new THREE.MeshStandardMaterial({ color: 0x2E7D32, roughness: 0.9, metalness: 0.0 }),
+	dirt: new THREE.MeshStandardMaterial({ color: 0x59472b, roughness: 0.9, metalness: 0.0 }),
+	stone: new THREE.MeshStandardMaterial({ color: 0x666666, roughness: 0.8, metalness: 0.0 }),
+	sand: new THREE.MeshStandardMaterial({ color: 0xdbc681, roughness: 0.9, metalness: 0.0 }),
+	sand_light: new THREE.MeshStandardMaterial({ color: 0xe8d9a0, roughness: 0.9, metalness: 0.0 }),
+	sand_red: new THREE.MeshStandardMaterial({ color: 0xc2a477, roughness: 0.9, metalness: 0.0 }),
+	sand_gold: new THREE.MeshStandardMaterial({ color: 0xd4b16a, roughness: 0.9, metalness: 0.0 }),
+	sand_dark: new THREE.MeshStandardMaterial({ color: 0xb49b6c, roughness: 0.9, metalness: 0.0 }),
+	wood: new THREE.MeshStandardMaterial({ color: 0x52341d, roughness: 0.8, metalness: 0.0 }),
+	snow: new THREE.MeshStandardMaterial({ color: 0xf5f5f5, roughness: 0.9, metalness: 0.0 }),
+	water: new THREE.MeshStandardMaterial({
 		color: 0x1a45a5,
 		transparent: true,
 		opacity: 0.8,
+		roughness: 0.2, // Water is smoother
+		metalness: 0.0
 	}),
-	cactus: new THREE.MeshLambertMaterial({ color: 0x2d742f }),
+	cactus: new THREE.MeshStandardMaterial({ color: 0x2d742f, roughness: 0.9, metalness: 0.0 }),
+	leaves: new THREE.MeshStandardMaterial({ color: 0x228B22, transparent: true, opacity: 0.7, roughness: 0.9, metalness: 0.0 }),
 };
 
 // Item display properties (colors, names, etc.)
 export const itemProperties = {
-	grass: { color: "#3A9D23", name: "Grass Block" },
+	grass: { color: "#2E7D32", name: "Grass Block" },
 	dirt: { color: "#59472B", name: "Dirt" },
 	stone: { color: "#666666", name: "Stone" },
 	sand: { color: "#DBC681", name: "Sand" },
 	water: { color: "#1E90FF", name: "Water" },
 	wood: { color: "#52341D", name: "Wood" },
+	leaves: { color: "#228B22", name: "Leaves" },
 	stick: {
 		color: "#8B5A2B",
 		name: "Stick",
@@ -239,6 +258,7 @@ export const initialPlayerInventory = {
 	wooden_axe: 0,
 	stone_axe: 0,
 	crafting_table: 0,
+	leaves: 0,
 };
 
 export function setMaxCachedChunks(value) {

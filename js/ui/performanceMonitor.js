@@ -4,7 +4,14 @@ import {
 	VIEW_DISTANCE_IDEAL,
 	VIEW_DISTANCE_MAX,
 	VIEW_DISTANCE_PRELOAD_FAR,
+	VIEW_DISTANCE_BORDER_EXPANSION,
 	setMaxCachedChunks,
+	updateActiveViewDistances,
+	currentViewDistanceMin,
+	currentViewDistanceIdeal,
+	currentViewDistanceMax,
+	currentViewDistancePreloadFar,
+	currentViewDistanceBorderExpansion
 } from "../config.js";
 // World manager needed to force terrain update on perf mode change
 // import { generateTerrainAroundPlayer } from '../world/worldManager.js';
@@ -13,6 +20,7 @@ let fpsDisplay, memoryDisplay, chunkCountDisplay, queueDisplay, cacheDisplay;
 let lastFpsUpdate = 0,
 	framesThisSecond = 0;
 let highPerfMode = false;
+let initialHardwareLevel = 3; // Default, will be overridden
 
 // References to be set by main.js
 let sceneRef, playerRef, simplexRef;
@@ -34,6 +42,17 @@ export function initPerformanceMonitor(_scene, _player, _simplex) {
 	setInterval(updateMemoryAndQueueStats, 1000); // Update these less frequently
 	window.gameModules = window.gameModules || {};
 	window.gameModules.performanceMonitor = { estimateHardwarePerformance }; // Expose estimator
+
+	// Estimate hardware performance and set initial view distances
+	initialHardwareLevel = estimateHardwarePerformance();
+	console.log(`[PerformanceMonitor] Initial hardware level detected: ${initialHardwareLevel}`);
+	setViewDistancesForHardwareLevel(initialHardwareLevel);
+
+	// --- DEBUG: Force a specific hardware level for view distance for testing ---
+	// console.log("[PerformanceMonitor] DEBUG: Forcing hardware level 3 for view distance settings.");
+	// setViewDistancesForHardwareLevel(3); 
+	// if (playerRef) playerRef.forceChunkUpdate = true; // Force update if debugging
+	// --- END DEBUG ---
 }
 
 export function updatePerformanceMetrics(terrainChunksCount) {
@@ -71,18 +90,8 @@ function togglePerformanceMode() {
 	highPerfMode = !highPerfMode;
 	const perfButton = document.getElementById("perfModeButton");
 
-	let newConfig = {
-		VIEW_DISTANCE_MIN,
-		VIEW_DISTANCE_IDEAL,
-		VIEW_DISTANCE_MAX,
-		VIEW_DISTANCE_PRELOAD_FAR,
-	};
-
 	if (highPerfMode) {
-		newConfig.VIEW_DISTANCE_MIN = 1;
-		newConfig.VIEW_DISTANCE_IDEAL = 1; // Reduced
-		newConfig.VIEW_DISTANCE_MAX = 2; // Reduced
-		newConfig.VIEW_DISTANCE_PRELOAD_FAR = 2; // Reduced
+		updateActiveViewDistances(1, 1, 2, 3, 4); // min, ideal, max, preload, border
 		setMaxCachedChunks(100);
 		if (sceneRef.fog) {
 			sceneRef.fog.near = 10;
@@ -91,8 +100,7 @@ function togglePerformanceMode() {
 		perfButton.textContent = "Normal Mode";
 		perfButton.style.background = "#553300";
 	} else {
-		// Restore default config values (these are imported, so they are the defaults)
-		// No need to re-assign newConfig, just use imported defaults.
+		setViewDistancesForHardwareLevel(initialHardwareLevel); // Restore based on initial hardware level
 		setMaxCachedChunks(500); // Default from config.js
 		if (sceneRef.fog) {
 			sceneRef.fog.near = 15;
@@ -102,28 +110,40 @@ function togglePerformanceMode() {
 		perfButton.style.background = "#333";
 	}
 
-	// Update globalish render distances (if worldManager reads them dynamically)
-	// Or, pass these newConfig values to worldManager's generateTerrain
-	// For now, assume worldManager reads from config.js which is fine if not dynamically changing those exports
-	// The VIEW_DISTANCE constants are used directly in worldManager.
-	// To make this work cleanly, worldManager should have setters for these or take them as params.
-	// A simpler way: worldManager imports these values, so changing them in config.js would require
-	// a way for worldManager to re-read them, or for these to be mutable and updated.
-	// For this refactor, we'll assume direct import is sufficient and a game restart/re-init might be needed
-	// for these types of changes, or worldManager needs to be more dynamic.
-	// The current structure requires `worldManager` to re-evaluate its view distances.
-	// Let's trigger a terrain regeneration in `worldManager`.
-	if (window.gameModules.worldManager && playerRef && sceneRef && simplexRef) {
-		// Update the config values (if they are not const exports)
-		// Since they are const, we need another mechanism.
-		// For now, this button might not dynamically change render distance fully without deeper refactor.
-		// The best approach is for worldManager to have functions like setRenderDistances.
-		// As a workaround for this example, player.forceChunkUpdate can trigger regeneration.
-		if (playerRef) playerRef.forceChunkUpdate = true;
-		console.log(
-			`Performance mode toggled. New ideal view distance: ${VIEW_DISTANCE_IDEAL} (from config)`
-		);
+	if (playerRef) playerRef.forceChunkUpdate = true;
+	console.log(
+		`Performance mode toggled. New ideal view distance: ${currentViewDistanceIdeal} (active)`
+	);
+}
+
+function setViewDistancesForHardwareLevel(hardwareLevel) {
+	let minVD, idealVD, maxVD, preloadVD, borderVD;
+	switch (hardwareLevel) {
+		case 1: // Lowest performance
+			minVD = 1; idealVD = 1; maxVD = 1;
+			preloadVD = 2; borderVD = 3;
+			break;
+		case 2:
+			minVD = 1; idealVD = 1; maxVD = 2;
+			preloadVD = 3; borderVD = 4;
+			break;
+		case 3: // Medium
+			minVD = VIEW_DISTANCE_MIN; idealVD = VIEW_DISTANCE_IDEAL; maxVD = VIEW_DISTANCE_MAX;
+			preloadVD = VIEW_DISTANCE_PRELOAD_FAR; borderVD = VIEW_DISTANCE_BORDER_EXPANSION;
+			break;
+		case 4: // High
+			minVD = VIEW_DISTANCE_MIN; idealVD = VIEW_DISTANCE_IDEAL + 1; maxVD = VIEW_DISTANCE_MAX + 1;
+			preloadVD = maxVD + 1; borderVD = maxVD + 2;
+			break;
+		case 5: // Highest performance
+		default:
+			minVD = VIEW_DISTANCE_MIN + 1; idealVD = VIEW_DISTANCE_IDEAL + 1; maxVD = VIEW_DISTANCE_MAX + 1;
+			preloadVD = maxVD + 1; borderVD = maxVD + 2;
+			break;
 	}
+	updateActiveViewDistances(minVD, idealVD, maxVD, preloadVD, borderVD);
+	console.log(`[PerformanceMonitor] View distances set for hardware level ${hardwareLevel}: Min=${minVD}, Ideal=${idealVD}, Max=${maxVD}, Preload=${preloadVD}, Border=${borderVD}`);
+	console.log(`[PerformanceMonitor] Config check: currentIdealVD = ${currentViewDistanceIdeal}, currentPreloadFar = ${currentViewDistancePreloadFar}`);
 }
 
 export function estimateHardwarePerformance() {

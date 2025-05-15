@@ -201,6 +201,21 @@ export function generateChunk(
 
 	for (const [type, positions] of Object.entries(blocksByMaterial)) {
 		if (positions.length === 0 || !blockMaterials[type]) continue;
+
+		const finalPositionsForType = [];
+		for (const pos of positions) {
+			const worldPosKey = `${pos.x},${pos.y},${pos.z}`;
+			// Check the FINAL block type in blockPositions
+			// Ensure that the block at this position in the authoritative blockPositions map
+			// is indeed of the current material type we are batching.
+			// This handles cases where a feature (like a tree trunk) overwrote a base terrain block.
+			if (chunkGroup.blockPositions[worldPosKey] && chunkGroup.blockPositions[worldPosKey].type === type) {
+				finalPositionsForType.push(pos);
+			}
+		}
+
+		if (finalPositionsForType.length === 0) continue; // Skip if no blocks of this type remain after feature overwrites
+
 		const material = blockMaterials[type].clone(); // Clone to allow individual fade
 		if (fadeIn) {
 			material.transparent = true;
@@ -209,14 +224,14 @@ export function generateChunk(
 		const instancedMesh = new THREE.InstancedMesh(
 			globalBlockGeometry,
 			material,
-			positions.length
+			finalPositionsForType.length // Use length of filtered positions
 		);
 		instancedMesh.userData.blockType = type; // Store blockType in userData
 		instancedMesh.userData.isInstanced = true; // Mark it as an instanced mesh for easier identification
 
 		const matrix = new THREE.Matrix4();
-		for (let i = 0; i < positions.length; i++) {
-			const pos = positions[i];
+		for (let i = 0; i < finalPositionsForType.length; i++) { // Iterate filtered positions
+			const pos = finalPositionsForType[i];
 			matrix.setPosition(pos.x, pos.y, pos.z);
 			instancedMesh.setMatrixAt(i, matrix);
 		}

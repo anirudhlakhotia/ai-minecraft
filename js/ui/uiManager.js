@@ -135,7 +135,7 @@ export function updateBlockSelector(playerInventory) {
 	const blockSelectorContainer = document.getElementById("blockSelector");
 
 	// Clear existing craftable/tool items except defaults
-	const defaultTypes = ["grass", "dirt", "stone", "sand", "wood"];
+	const defaultTypes = ["grass", "dirt", "stone", "sand", "wood", "leaves"];
 	blockSelectorContainer.querySelectorAll(".block-type").forEach((el) => {
 		if (!defaultTypes.includes(el.dataset.type)) {
 			el.remove();

@@ -1,10 +1,17 @@
-import { DAY_NIGHT_DURATION } from "../config.js";
+import { DAY_NIGHT_DURATION, CHUNK_SIZE } from "../config.js";
 import { estimateHardwarePerformance } from "../ui/performanceMonitor.js";
 // import { updateDayNightCycleVisuals } from "../ui/dayNightCycle.js";
 
 let scene, camera, renderer, raycaster, mouse;
 let highlightBox;
 let dayNightCycleState; // Will be initialized by main.js
+
+// Reusable objects for updateBlockHighlight
+const reusableBox = new THREE.Box3();
+const reusableVec1 = new THREE.Vector3();
+const reusableVec2 = new THREE.Vector3();
+const reusableIntersectPoint = new THREE.Vector3(); // For intersectBox result
+const reusableRayDirection = new THREE.Vector3(); // For normal calculation
 
 export function initRenderer(_dayNightCycleState) {
 	dayNightCycleState = _dayNightCycleState;
@@ -20,14 +27,25 @@ export function initRenderer(_dayNightCycleState) {
 		1000
 	);
 
+	const hardwareLevel = estimateHardwarePerformance();
 	renderer = new THREE.WebGLRenderer({
-		antialias: false,
+		antialias: hardwareLevel > 3,
 		alpha: false,
 		preserveDrawingBuffer: false,
 		powerPreference: "high-performance",
 	});
 	renderer.precision = "mediump";
-	renderer.setPixelRatio(Math.min(window.devicePixelRatio, 1.5));
+
+	if (hardwareLevel <= 1) {
+		renderer.setPixelRatio(0.75);
+	} else if (hardwareLevel === 2) {
+		renderer.setPixelRatio(1);
+	} else if (hardwareLevel === 3) {
+		renderer.setPixelRatio(Math.min(window.devicePixelRatio, 1.25));
+	} else {
+		renderer.setPixelRatio(Math.min(window.devicePixelRatio, 1.5));
+	}
+
 	renderer.shadowMap.enabled = true;
 	renderer.shadowMap.type = THREE.PCFSoftShadowMap;
 	renderer.setSize(window.innerWidth, window.innerHeight);
@@ -37,7 +55,7 @@ export function initRenderer(_dayNightCycleState) {
 	raycaster = new THREE.Raycaster();
 	mouse = new THREE.Vector2();
 
-	setupHighlyOptimizedLights(scene, dayNightCycleState);
+	setupHighlyOptimizedLights(scene, dayNightCycleState, hardwareLevel);
 	initHighlightBox(scene);
 
 	return { scene, camera, renderer, raycaster, mouse };
@@ -59,8 +77,7 @@ export function getMouse() {
 	return mouse;
 }
 
-function setupHighlyOptimizedLights(_scene, _dayNightCycleState) {
-	const hardwareLevel = estimateHardwarePerformance();
+function setupHighlyOptimizedLights(_scene, _dayNightCycleState, hardwareLevel) {
 	const isMobile = /Android|iPhone|iPad|iPod|Windows Phone/i.test(
 		navigator.userAgent
 	);
@@ -147,38 +164,127 @@ export function updateBlockHighlight(
 		return;
 	}
 
-	raycaster.setFromCamera({ x: 0, y: 0 }, camera);
-	const intersections = [];
+	raycaster.setFromCamera({ x: 0, y: 0 }, camera); // Center of screen
 
-	Object.values(terrainChunks).forEach((chunk) => {
-		if (!chunk || !chunk.blockPositions) return;
-		for (const [posKey, blockData] of Object.entries(chunk.blockPositions)) {
-			const [x, y, z] = posKey.split(",").map(Number);
-			const blockBox = new THREE.Box3(
-				new THREE.Vector3(x - 0.5, y - 0.5, z - 0.5),
-				new THREE.Vector3(x + 0.5, y + 0.5, z + 0.5)
-			);
-			const intersect = raycaster.ray.intersectBox(
-				blockBox,
-				new THREE.Vector3()
-			);
-			if (intersect) {
-				intersections.push({
-					distance: intersect.distanceTo(camera.position),
-					point: intersect.clone(),
-					normal: raycaster.ray.direction.clone().negate(), // This normal is approximate
-					blockPosition: { x, y, z },
-					chunk: chunk,
+	const ray = raycaster.ray;
+	const interactionRange = 5; // Max distance to check for blocks
+
+	// Voxel Traversal (Amanatides & Woo)
+	let cvx = Math.floor(ray.origin.x);
+	let cvy = Math.floor(ray.origin.y);
+	let cvz = Math.floor(ray.origin.z);
+
+	const stepX = ray.direction.x > 0 ? 1 : -1;
+	const stepY = ray.direction.y > 0 ? 1 : -1;
+	const stepZ = ray.direction.z > 0 ? 1 : -1;
+
+	// Prevent division by zero, if ray is parallel to an axis, tDelta will be Infinity
+	const tDeltaX = Math.abs(1 / ray.direction.x);
+	const tDeltaY = Math.abs(1 / ray.direction.y);
+	const tDeltaZ = Math.abs(1 / ray.direction.z);
+
+	let tMaxX, tMaxY, tMaxZ;
+	if (ray.direction.x > 0) {
+		tMaxX = (cvx + 1 - ray.origin.x) * tDeltaX;
+	} else if (ray.direction.x < 0) {
+		tMaxX = (ray.origin.x - cvx) * tDeltaX;
+	} else {
+		tMaxX = Infinity;
+	}
+	if (ray.direction.y > 0) {
+		tMaxY = (cvy + 1 - ray.origin.y) * tDeltaY;
+	} else if (ray.direction.y < 0) {
+		tMaxY = (ray.origin.y - cvy) * tDeltaY;
+	} else {
+		tMaxY = Infinity;
+	}
+	if (ray.direction.z > 0) {
+		tMaxZ = (cvz + 1 - ray.origin.z) * tDeltaZ;
+	} else if (ray.direction.z < 0) {
+		tMaxZ = (ray.origin.z - cvz) * tDeltaZ;
+	} else {
+		tMaxZ = Infinity;
+	}
+
+	let targetIntersection = null;
+	let currentDistance = 0;
+
+	for (let i = 0; i < Math.ceil(interactionRange * Math.max(tDeltaX, tDeltaY, tDeltaZ)) + 2 && currentDistance < interactionRange; i++) {
+		const chunkX = Math.floor(cvx / CHUNK_SIZE);
+		const chunkZ = Math.floor(cvz / CHUNK_SIZE);
+		const chunkKey = `${chunkX},${chunkZ}`;
+		const currentChunk = terrainChunks[chunkKey];
+		const blockKey = `${cvx},${cvy},${cvz}`;
+		const blockData = currentChunk?.blockPositions?.[blockKey];
+
+		if (blockData) {
+			// Block found, calculate intersection details
+			let hitPoint = reusableIntersectPoint.copy(ray.origin);
+			let normal = reusableRayDirection; // Will be set below
+			let t;
+
+			if (tMaxX < tMaxY) {
+				if (tMaxX < tMaxZ) {
+					t = tMaxX;
+					normal.set(-stepX, 0, 0);
+				} else {
+					t = tMaxZ;
+					normal.set(0, 0, -stepZ);
+				}
+			} else {
+				if (tMaxY < tMaxZ) {
+					t = tMaxY;
+					normal.set(0, -stepY, 0);
+				} else {
+					t = tMaxZ;
+					normal.set(0, 0, -stepZ);
+				}
+			}
+
+			hitPoint.addScaledVector(ray.direction, t);
+			currentDistance = ray.origin.distanceTo(hitPoint);
+
+			if (currentDistance <= interactionRange) {
+				targetIntersection = {
+					distance: currentDistance,
+					point: hitPoint.clone(),
+					normal: normal.clone(),
+					blockPosition: { x: cvx, y: cvy, z: cvz },
+					chunk: currentChunk, // May be undefined if block found at edge of loaded area
 					blockData: blockData,
-				});
+				};
+			}
+			break; // Found a block
+		}
+
+		// Advance to next voxel
+		if (tMaxX < tMaxY) {
+			if (tMaxX < tMaxZ) {
+				cvx += stepX;
+				tMaxX += tDeltaX;
+				currentDistance = tMaxX / tDeltaX; // Approximation of voxel units traveled
+			} else {
+				cvz += stepZ;
+				tMaxZ += tDeltaZ;
+				currentDistance = tMaxZ / tDeltaZ;
+			}
+		} else {
+			if (tMaxY < tMaxZ) {
+				cvy += stepY;
+				tMaxY += tDeltaY;
+				currentDistance = tMaxY / tDeltaY;
+			} else {
+				cvz += stepZ;
+				tMaxZ += tDeltaZ;
+				currentDistance = tMaxZ / tDeltaZ;
 			}
 		}
-	});
+		if (currentDistance > interactionRange) break; // Exceeded interaction range
+	}
 
-	intersections.sort((a, b) => a.distance - b.distance);
 
-	if (intersections.length > 0 && intersections[0].distance < 5) {
-		const target = intersections[0];
+	if (targetIntersection) {
+		const target = targetIntersection;
 		highlightBox.position.set(
 			target.blockPosition.x,
 			target.blockPosition.y,
@@ -186,13 +292,13 @@ export function updateBlockHighlight(
 		);
 
 		if (keyboardState && keyboardState.shift) {
-			highlightBox.material.color.setHex(0xff3333);
+			highlightBox.material.color.setHex(0xff3333); // Red for breaking (shift)
 		} else {
-			highlightBox.material.color.setHex(0xffffff);
+			highlightBox.material.color.setHex(0xffffff); // Default white
 		}
 		highlightBox.visible = true;
 		highlightBox.material.opacity =
-			0.8 + 0.2 * Math.sin(performance.now() * 0.005);
+			0.8 + 0.2 * Math.sin(performance.now() * 0.005); // Pulsating effect
 	} else {
 		highlightBox.visible = false;
 	}

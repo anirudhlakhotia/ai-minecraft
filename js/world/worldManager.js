@@ -1,11 +1,15 @@
 import {
 	CHUNK_SIZE,
-	VIEW_DISTANCE_MIN,
-	VIEW_DISTANCE_IDEAL,
-	VIEW_DISTANCE_MAX,
+	// VIEW_DISTANCE_MIN, // Use currentViewDistanceMin instead
+	// VIEW_DISTANCE_IDEAL, // Use currentViewDistanceIdeal instead
+	// VIEW_DISTANCE_MAX, // Use currentViewDistanceMax instead
+	currentViewDistanceMin,
+	currentViewDistanceIdeal,
+	currentViewDistanceMax,
 	VIEW_DISTANCE_PRELOAD_FAR,
 	VIEW_DISTANCE_BORDER_EXPANSION,
 	MAX_CACHED_CHUNKS,
+	DAY_NIGHT_DURATION,
 } from "../config.js";
 import {
 	generateChunk,
@@ -25,6 +29,7 @@ import { findSafeSpawnPoint } from "./terrainGenerator.js";
 export let terrain = {}; // Active chunks in scene
 export let chunkLoadingQueue = [];
 export let processingChunk = false;
+let queuedChunkKeys = new Set(); // Declare queuedChunkKeys
 export let currentBiome = "forest"; // Default biome
 
 // For predictive loading
@@ -66,6 +71,7 @@ export function setCurrentBiome(newBiome, player, scene, simplex) {
 	});
 	terrain = {};
 	chunkLoadingQueue = []; // Clear loading queue
+	queuedChunkKeys.clear(); // Clear the set too
 
 	generateTerrainAroundPlayer(player, scene, simplex); // Regenerate
 	updateCacheUIDisplay();
@@ -117,14 +123,13 @@ function updatePlayerDirectionForWorld(player) {
 
 export function generateTerrainAroundPlayer(player, scene, simplex) {
 	if (player.isSpawning) {
-		// Clear existing terrain and cache if spawning into a new biome (handled by setCurrentBiome)
-		// For respawn in same biome, just clear active terrain.
 		Object.keys(terrain).forEach((chunkKey) => {
 			disposeChunk(terrain[chunkKey], scene);
 			delete terrain[chunkKey];
 		});
 		terrain = {};
 		chunkLoadingQueue = [];
+		queuedChunkKeys.clear(); // Clear the set too
 	}
 
 	const playerChunkX = Math.floor(player.position.x / CHUNK_SIZE);
@@ -136,13 +141,13 @@ export function generateTerrainAroundPlayer(player, scene, simplex) {
 	let newChunksAddedToQueue = false;
 
 	// Pass 1: Immediate visibility (Minimum Render Distance)
-	for (let x = -VIEW_DISTANCE_MIN; x <= VIEW_DISTANCE_MIN; x++) {
-		for (let z = -VIEW_DISTANCE_MIN; z <= VIEW_DISTANCE_MIN; z++) {
+	for (let x = -currentViewDistanceMin; x <= currentViewDistanceMin; x++) {
+		for (let z = -currentViewDistanceMin; z <= currentViewDistanceMin; z++) {
 			const chunkX = playerChunkX + x;
 			const chunkZ = playerChunkZ + z;
 			const chunkKey = `${chunkX},${chunkZ}`;
 			activeChunks.add(chunkKey);
-			if (!terrain[chunkKey]) {
+			if (!terrain[chunkKey]) { // No need to check queue, this pass is immediate
 				const newChunk = generateChunk(
 					chunkX,
 					chunkZ,
@@ -153,7 +158,7 @@ export function generateTerrainAroundPlayer(player, scene, simplex) {
 					chunkModifications[chunkKey],
 					3,
 					false
-				); // priority 3, no fade
+				);
 				if (newChunk) terrain[chunkKey] = newChunk;
 			} else if (terrain[chunkKey].userData) {
 				terrain[chunkKey].userData.lastAccessed = Date.now();
@@ -162,20 +167,17 @@ export function generateTerrainAroundPlayer(player, scene, simplex) {
 	}
 
 	// Pass 2: Standard visibility (Ideal Render Distance)
-	for (let x = -VIEW_DISTANCE_IDEAL; x <= VIEW_DISTANCE_IDEAL; x++) {
-		for (let z = -VIEW_DISTANCE_IDEAL; z <= VIEW_DISTANCE_IDEAL; z++) {
-			if (Math.abs(x) <= VIEW_DISTANCE_MIN && Math.abs(z) <= VIEW_DISTANCE_MIN)
+	for (let x = -currentViewDistanceIdeal; x <= currentViewDistanceIdeal; x++) {
+		for (let z = -currentViewDistanceIdeal; z <= currentViewDistanceIdeal; z++) {
+			if (Math.abs(x) <= currentViewDistanceMin && Math.abs(z) <= currentViewDistanceMin)
 				continue;
 			const chunkX = playerChunkX + x;
 			const chunkZ = playerChunkZ + z;
 			const chunkKey = `${chunkX},${chunkZ}`;
 			activeChunks.add(chunkKey);
-			if (
-				!terrain[chunkKey] &&
-				!chunkLoadingQueue.some((c) => c.x === chunkX && c.z === chunkZ)
-			) {
+			if (!terrain[chunkKey] && !queuedChunkKeys.has(chunkKey)) { // Use Set
 				if (addChunkToLoadingQueue(chunkX, chunkZ, 2, true))
-					newChunksAddedToQueue = true; // priority 2, fade in
+					newChunksAddedToQueue = true;
 			} else if (terrain[chunkKey] && terrain[chunkKey].userData) {
 				terrain[chunkKey].userData.lastAccessed = Date.now();
 			}
@@ -183,23 +185,20 @@ export function generateTerrainAroundPlayer(player, scene, simplex) {
 	}
 
 	// Pass 3: Extended visibility (Maximum Render Distance)
-	for (let x = -VIEW_DISTANCE_MAX; x <= VIEW_DISTANCE_MAX; x++) {
-		for (let z = -VIEW_DISTANCE_MAX; z <= VIEW_DISTANCE_MAX; z++) {
+	for (let x = -currentViewDistanceMax; x <= currentViewDistanceMax; x++) {
+		for (let z = -currentViewDistanceMax; z <= currentViewDistanceMax; z++) {
 			if (
-				Math.abs(x) <= VIEW_DISTANCE_IDEAL &&
-				Math.abs(z) <= VIEW_DISTANCE_IDEAL
+				Math.abs(x) <= currentViewDistanceIdeal &&
+				Math.abs(z) <= currentViewDistanceIdeal
 			)
 				continue;
 			const chunkX = playerChunkX + x;
 			const chunkZ = playerChunkZ + z;
 			const chunkKey = `${chunkX},${chunkZ}`;
 			activeChunks.add(chunkKey);
-			if (
-				!terrain[chunkKey] &&
-				!chunkLoadingQueue.some((c) => c.x === chunkX && c.z === chunkZ)
-			) {
+			if (!terrain[chunkKey] && !queuedChunkKeys.has(chunkKey)) { // Use Set
 				if (addChunkToLoadingQueue(chunkX, chunkZ, 1, true))
-					newChunksAddedToQueue = true; // priority 1
+					newChunksAddedToQueue = true;
 			} else if (terrain[chunkKey] && terrain[chunkKey].userData) {
 				terrain[chunkKey].userData.lastAccessed = Date.now();
 			}
@@ -208,35 +207,28 @@ export function generateTerrainAroundPlayer(player, scene, simplex) {
 
 	// Pass 4: Look-ahead chunks (Preload Far Distance)
 	if (playerDirection.lengthSq() > 0.1) {
-		// If player is moving or looking
-		const lookAheadX = Math.round(playerDirection.x * 2); // More direct
+		const lookAheadX = Math.round(playerDirection.x * 2);
 		const lookAheadZ = Math.round(playerDirection.z * 2);
 
 		for (
-			let dist = VIEW_DISTANCE_MAX + 1;
+			let dist = currentViewDistanceMax + 1;
 			dist <= VIEW_DISTANCE_PRELOAD_FAR;
 			dist++
 		) {
 			for (let spread = -1; spread <= 1; spread++) {
-				// Check a small cone
 				let preloadX, preloadZ;
 				if (Math.abs(lookAheadX) > Math.abs(lookAheadZ)) {
-					// Moving more along X
 					preloadX = playerChunkX + (lookAheadX > 0 ? dist : -dist);
 					preloadZ = playerChunkZ + spread;
 				} else {
-					// Moving more along Z
 					preloadX = playerChunkX + spread;
 					preloadZ = playerChunkZ + (lookAheadZ > 0 ? dist : -dist);
 				}
 				const chunkKey = `${preloadX},${preloadZ}`;
-				activeChunks.add(chunkKey); // Should be active if preloaded
-				if (
-					!terrain[chunkKey] &&
-					!chunkLoadingQueue.some((c) => c.x === preloadX && c.z === preloadZ)
-				) {
+				activeChunks.add(chunkKey);
+				if (!terrain[chunkKey] && !queuedChunkKeys.has(chunkKey)) { // Use Set
 					if (addChunkToLoadingQueue(preloadX, preloadZ, 0, true))
-						newChunksAddedToQueue = true; // priority 0
+						newChunksAddedToQueue = true;
 				} else if (terrain[chunkKey] && terrain[chunkKey].userData) {
 					terrain[chunkKey].userData.lastAccessed = Date.now();
 				}
@@ -245,7 +237,7 @@ export function generateTerrainAroundPlayer(player, scene, simplex) {
 	}
 
 	// Pass 5: World Border Expansion
-	if (detectAndExpandWorldBorder(player, activeChunks)) {
+	if (detectAndExpandWorldBorder(playerChunkX, playerChunkZ, playerDirection, activeChunks)) { // Pass playerChunkX/Z and direction
 		newChunksAddedToQueue = true;
 	}
 
@@ -255,8 +247,8 @@ export function generateTerrainAroundPlayer(player, scene, simplex) {
 			const chunk = terrain[chunkKey];
 			if (chunk.userData && chunk.userData.fadeState !== "out") {
 				chunk.userData.fadeState = "out";
-				chunk.userData.fadeProgress = 1; // Start fade out from full opacity
-				chunk.userData.targetCache = true; // Mark for caching
+				chunk.userData.fadeProgress = 1;
+				chunk.userData.targetCache = true;
 				chunk.traverse((object) => {
 					if (object.material) {
 						object.material.transparent = true;
@@ -306,11 +298,12 @@ function addChunkToLoadingQueue(x, z, priority, fadeIn, isBorder = false) {
 	if (
 		terrain[key] ||
 		isChunkInCache(x, z) ||
-		chunkLoadingQueue.some((c) => c.x === x && c.z === z)
+		queuedChunkKeys.has(key) // Use Set for check
 	) {
 		return false; // Already loaded, in cache, or in queue
 	}
 	chunkLoadingQueue.push({ x, z, priority, fadeIn, isBorderChunk: isBorder });
+	queuedChunkKeys.add(key); // Add to Set
 	return true;
 }
 
@@ -333,13 +326,16 @@ export function processChunkLoadingQueue(scene, simplex, player) {
 	});
 
 	const nextChunkData = chunkLoadingQueue.shift();
+	const chunkKey = `${nextChunkData.x},${nextChunkData.z}`;
+	queuedChunkKeys.delete(chunkKey); // Remove from Set
+
 	processingChunk = true;
 
 	setTimeout(() => {
 		try {
-			if (!terrain[`${nextChunkData.x},${nextChunkData.z}`]) {
+			if (!terrain[chunkKey]) {
 				const mods =
-					chunkModifications[`${nextChunkData.x},${nextChunkData.z}`];
+					chunkModifications[chunkKey];
 				const newChunk = generateChunk(
 					nextChunkData.x,
 					nextChunkData.z,
@@ -352,7 +348,7 @@ export function processChunkLoadingQueue(scene, simplex, player) {
 					nextChunkData.fadeIn
 				);
 				if (newChunk)
-					terrain[`${nextChunkData.x},${nextChunkData.z}`] = newChunk;
+					terrain[chunkKey] = newChunk;
 			}
 		} catch (error) {
 			console.error("Error processing chunk from queue:", error);
@@ -365,48 +361,52 @@ export function processChunkLoadingQueue(scene, simplex, player) {
 	}, 0); // Yield to browser
 }
 
-function detectAndExpandWorldBorder(player, activeChunks) {
-	const playerChunkX = Math.floor(player.position.x / CHUNK_SIZE);
-	const playerChunkZ = Math.floor(player.position.z / CHUNK_SIZE);
+function detectAndExpandWorldBorder(playerChunkX, playerChunkZ, playerDirection, activeChunks) { // Added playerDirection
 	const directions = [
-		{ x: 1, z: 0 },
-		{ x: -1, z: 0 },
-		{ x: 0, z: 1 },
-		{ x: 0, z: -1 },
+		{ x: 1, z: 0 }, { x: -1, z: 0 },
+		{ x: 0, z: 1 }, { x: 0, z: -1 },
+		// Optional: Add player's current general direction if moving significantly
 	];
+    // Consider adding player's actual direction to the 'directions' array if they are moving consistently
+    // This can make border expansion more targeted towards where the player is heading.
+    // Example:
+    // if (playerDirection.lengthSq() > 0.5) { // Threshold for consistent movement
+    //    const primaryDir = {x: Math.round(playerDirection.x), z: Math.round(playerDirection.z)};
+    //    if ((primaryDir.x !== 0 || primaryDir.z !== 0) && !directions.some(d => d.x === primaryDir.x && d.z === primaryDir.z)) {
+    //        directions.push(primaryDir);
+    //    }
+    // }
+
 	let expansionOccurred = false;
 	const expansionIndicator = document.getElementById("worldExpansionIndicator");
 
 	directions.forEach((dir) => {
 		for (
-			let dist = VIEW_DISTANCE_MAX;
+			let dist = currentViewDistanceMax; // Start checking from max visible distance
 			dist <= VIEW_DISTANCE_BORDER_EXPANSION;
 			dist++
 		) {
 			let borderFoundAtThisDist = false;
 			for (let spread = -2; spread <= 2; spread++) {
-				// Check a wider path for borders
 				const checkX = playerChunkX + dir.x * dist + (dir.z !== 0 ? spread : 0);
 				const checkZ = playerChunkZ + dir.z * dist + (dir.x !== 0 ? spread : 0);
+				const checkKey = `${checkX},${checkZ}`;
 
 				if (
-					!terrain[`${checkX},${checkZ}`] &&
+					!terrain[checkKey] &&
 					!isChunkInCache(checkX, checkZ) &&
-					!chunkLoadingQueue.some((c) => c.x === checkX && c.z === checkZ)
+					!queuedChunkKeys.has(checkKey) // Use Set
 				) {
-					// Found a point where a chunk is missing (potential border)
-					// Now expand from this point outwards up to BORDER_EXPANSION
 					for (
-						let expansionDist = dist;
+						let expansionDist = dist; // Start from current distance
 						expansionDist <= VIEW_DISTANCE_BORDER_EXPANSION;
 						expansionDist++
 					) {
 						for (
-							let expansionSpread = -1;
+							let expansionSpread = -1; // Narrower spread for actual expansion
 							expansionSpread <= 1;
 							expansionSpread++
 						) {
-							// Expand a strip
 							const newChunkX =
 								playerChunkX +
 								dir.x * expansionDist +
@@ -416,17 +416,16 @@ function detectAndExpandWorldBorder(player, activeChunks) {
 								dir.z * expansionDist +
 								(dir.x !== 0 ? expansionSpread : 0);
 							if (addChunkToLoadingQueue(newChunkX, newChunkZ, 0, true, true)) {
-								// Low priority for border expansion
-								activeChunks.add(`${newChunkX},${newChunkZ}`); // Consider it active for this cycle
+								activeChunks.add(`${newChunkX},${newChunkZ}`);
 								expansionOccurred = true;
 							}
 						}
 					}
 					borderFoundAtThisDist = true;
-					break; // Stop checking spreads for this distance, move to next distance or direction
+					break; 
 				}
 			}
-			if (borderFoundAtThisDist) break; // Found and expanded border for this direction
+			if (borderFoundAtThisDist) break; 
 		}
 	});
 
